@@ -8,6 +8,7 @@ import app.fastdrive.android.api.ApiException
 import app.fastdrive.android.api.ChangesPage
 import app.fastdrive.android.api.Cursor
 import app.fastdrive.android.api.DriveApi
+import app.fastdrive.android.auth.TokenAccess
 import app.fastdrive.android.auth.TokenStore
 import app.fastdrive.android.data.AppDatabase
 import app.fastdrive.android.data.CachedFile
@@ -29,7 +30,7 @@ private const val CURSOR_KEY = "changes_cursor"
 
 class FileListViewModel(
     private val database: AppDatabase,
-    private val tokenStore: TokenStore,
+    private val tokenStore: TokenAccess,
     context: Context,
     // Defaults to the real API, but taken as a plain suspend function so a test can substitute a
     // fake multi-page sequence without needing a real DriveApi/network stack.

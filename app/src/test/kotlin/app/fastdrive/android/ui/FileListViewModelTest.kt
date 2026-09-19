@@ -8,7 +8,7 @@ import app.fastdrive.android.api.ChangesPage
 import app.fastdrive.android.api.Cursor
 import app.fastdrive.android.api.GoneEntry
 import app.fastdrive.android.api.RemoteFile
-import app.fastdrive.android.auth.TokenStore
+import app.fastdrive.android.auth.TokenAccess
 import app.fastdrive.android.data.AppDatabase
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -26,19 +26,28 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 
+/** A plain in-memory fake, so tests don't need a real TokenStore — Robolectric's JVM has no
+ *  AndroidKeyStore provider, so constructing EncryptedSharedPreferences there throws. */
+private class FakeTokenAccess(initial: String? = null) : TokenAccess {
+    private var token: String? = initial
+    override fun getToken(): String? = token
+    override fun setToken(token: String?) { this.token = token }
+    override fun clear() { token = null }
+}
+
 /**
- * Room's DAO needs a real Android environment (see CachedFileDaoTest), and TokenStore needs a
- * Context to build its EncryptedSharedPreferences, so this runs under Robolectric like the other
- * data-layer tests. The actual HTTP layer is swapped out for a plain fake `changesFetcher`
- * function so pagination/upsert/delete/cursor-advance and the error paths can be exercised without
- * a real DriveApi or network stack.
+ * Room's DAO needs a real Android environment (see CachedFileDaoTest), so this runs under
+ * Robolectric like the other data-layer tests. The actual HTTP layer is swapped out for a plain
+ * fake `changesFetcher` function, and TokenStore for a `FakeTokenAccess`, so pagination/upsert/
+ * delete/cursor-advance and the error paths can be exercised without a real DriveApi, TokenStore,
+ * or network stack.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
 class FileListViewModelTest {
 
     private lateinit var database: AppDatabase
-    private lateinit var tokenStore: TokenStore
+    private lateinit var tokenStore: FakeTokenAccess
     private lateinit var context: Context
     private val dispatcher = StandardTestDispatcher()
 
@@ -49,7 +58,7 @@ class FileListViewModelTest {
         database = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
             .allowMainThreadQueries()
             .build()
-        tokenStore = TokenStore(context)
+        tokenStore = FakeTokenAccess()
     }
 
     @After
