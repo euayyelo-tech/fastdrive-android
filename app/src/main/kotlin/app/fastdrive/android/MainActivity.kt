@@ -9,6 +9,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.core.content.ContextCompat
@@ -22,9 +25,6 @@ import app.fastdrive.android.data.AppDatabase
 import app.fastdrive.android.ui.FileListScreen
 import app.fastdrive.android.ui.FileListViewModel
 import app.fastdrive.android.ui.SignInScreen
-
-// TODO(Task 4/5): move this to a build config / settings screen instead of hardcoding.
-private const val API_BASE_URL = "https://fastdrive.app"
 
 class MainActivity : ComponentActivity() {
     // Android 13+ requires an explicit runtime prompt for notification permissions; the manifest
@@ -45,7 +45,10 @@ class MainActivity : ComponentActivity() {
         }
 
         val tokenStore = TokenStore(applicationContext)
-        val api = DriveApi(baseUrl = API_BASE_URL, token = tokenStore.getToken())
+        // tokenProvider reads TokenStore fresh on every call, so DriveApi always sees the current
+        // token with no separate sync step — sign-in, sign-out, and a 401-triggered
+        // TokenStore.clear() are all picked up automatically.
+        val api = DriveApi(baseUrl = BuildConfig.API_BASE_URL, tokenProvider = { tokenStore.getToken() })
         val database = AppDatabase.get(applicationContext)
 
         setContent {
@@ -60,7 +63,6 @@ class MainActivity : ComponentActivity() {
                                 api = api,
                                 tokenStore = tokenStore,
                                 onSignedIn = {
-                                    api.setToken(tokenStore.getToken())
                                     navController.navigate("files") {
                                         popUpTo("sign_in") { inclusive = true }
                                     }
@@ -69,9 +71,17 @@ class MainActivity : ComponentActivity() {
                         }
                         composable("files") {
                             val fileListViewModel: FileListViewModel = viewModel(
-                                factory = FileListViewModel.Factory(api, database, applicationContext),
+                                factory = FileListViewModel.Factory(api, database, tokenStore, applicationContext),
                             )
-                            FileListScreen(viewModel = fileListViewModel, baseUrl = API_BASE_URL)
+                            val signedOut by fileListViewModel.signedOut.collectAsState()
+                            LaunchedEffect(signedOut) {
+                                if (signedOut) {
+                                    navController.navigate("sign_in") {
+                                        popUpTo("files") { inclusive = true }
+                                    }
+                                }
+                            }
+                            FileListScreen(viewModel = fileListViewModel, baseUrl = BuildConfig.API_BASE_URL)
                         }
                     }
                 }

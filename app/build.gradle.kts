@@ -17,6 +17,10 @@ android {
         targetSdk = 37
         versionCode = 1
         versionName = "0.1.0"
+
+        // The real API host — NOT https://fastdrive.app, which is the marketing site and 404s on
+        // every API route. Confirmed against desktop/src/main/settings.ts's DEFAULT_BASE.
+        buildConfigField("String", "API_BASE_URL", "\"https://app.fastdrive.app\"")
     }
 
     buildTypes {
@@ -32,6 +36,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     testOptions {
@@ -85,4 +90,5 @@ dependencies {
     testImplementation(libs.robolectric)
     testImplementation(libs.androidx.test.core)
     testImplementation(libs.work.testing)
+    testImplementation(libs.kotlinx.coroutines.test)
 }
