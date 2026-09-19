@@ -1,6 +1,7 @@
 package app.fastdrive.android.ui
 
-import androidx.compose.foundation.layout.Column
+import android.content.Context
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
@@ -13,12 +14,18 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.workDataOf
 import app.fastdrive.android.data.CachedFile
+import app.fastdrive.android.download.DownloadWorker
 
 @Composable
-fun FileListScreen(viewModel: FileListViewModel) {
+fun FileListScreen(viewModel: FileListViewModel, baseUrl: String) {
     val files by viewModel.files.collectAsState()
+    val context = LocalContext.current
 
     LaunchedEffect(Unit) {
         viewModel.refresh()
@@ -26,19 +33,33 @@ fun FileListScreen(viewModel: FileListViewModel) {
 
     LazyColumn(modifier = Modifier.fillMaxWidth()) {
         items(files, key = { it.id }) { file ->
-            FileRow(file)
+            FileRow(file, onClick = { enqueueDownload(context, baseUrl, file) })
             HorizontalDivider()
         }
     }
 }
 
+private fun enqueueDownload(context: Context, baseUrl: String, file: CachedFile) {
+    val request = OneTimeWorkRequestBuilder<DownloadWorker>()
+        .setInputData(
+            workDataOf(
+                "file_id" to file.id,
+                "file_name" to file.name,
+                "base_url" to baseUrl,
+            ),
+        )
+        .build()
+    WorkManager.getInstance(context).enqueue(request)
+}
+
 @Composable
-private fun FileRow(file: CachedFile) {
-    // TODO(Task 5): make this row clickable and hand file.id to the download worker.
+private fun FileRow(file: CachedFile, onClick: () -> Unit) {
     ListItem(
         headlineContent = { Text(file.name) },
         supportingContent = { Text(formatSize(file.size)) },
-        modifier = Modifier.padding(horizontal = 4.dp),
+        modifier = Modifier
+            .padding(horizontal = 4.dp)
+            .clickable(onClick = onClick),
     )
 }
 

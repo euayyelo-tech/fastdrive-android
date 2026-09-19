@@ -11,11 +11,19 @@ import okhttp3.RequestBody.Companion.toRequestBody
 
 class ApiException(val status: Int, message: String) : Exception(message)
 
+/**
+ * Seam for [DriveApi.downloadUrl] so callers (namely `DownloadWorker`) can be unit-tested with a
+ * fake implementation instead of a real network client.
+ */
+interface DownloadUrlProvider {
+    suspend fun downloadUrl(fileId: String): DownloadUrlResponse
+}
+
 class DriveApi(
     private val baseUrl: String,
     private var token: String? = null,
     private val client: OkHttpClient = OkHttpClient(),
-) {
+) : DownloadUrlProvider {
     private val json = Json { ignoreUnknownKeys = true }
 
     fun setToken(t: String?) { token = t }
@@ -55,9 +63,9 @@ class DriveApi(
             call("/api/changes$query")
         }
 
-    suspend fun downloadUrl(id: String): DownloadUrlResponse =
+    override suspend fun downloadUrl(fileId: String): DownloadUrlResponse =
         withContext(Dispatchers.IO) {
-            call("/api/files/$id/download")
+            call("/api/files/$fileId/download")
         }
 
     // The desktop client's whoami() hits `/api/files?folder=` (there is no dedicated
