@@ -19,18 +19,22 @@ interface DownloadUrlProvider {
     suspend fun downloadUrl(fileId: String): DownloadUrlResponse
 }
 
+/**
+ * [tokenProvider] is read fresh on every call instead of caching a token field, so `DriveApi`
+ * always sees whatever `TokenStore` currently holds with no separate sync step — e.g. after
+ * sign-in, sign-out, or a 401-triggered `TokenStore.clear()`, the very next call already sees the
+ * new value. `DownloadWorker` already follows this pattern; this brings `DriveApi` in line with it.
+ */
 class DriveApi(
     private val baseUrl: String,
-    private var token: String? = null,
+    private val tokenProvider: () -> String? = { null },
     private val client: OkHttpClient = OkHttpClient(),
 ) : DownloadUrlProvider {
     private val json = Json { ignoreUnknownKeys = true }
 
-    fun setToken(t: String?) { token = t }
-
     private inline fun <reified T> call(path: String, method: String = "GET", body: String? = null): T {
         val requestBuilder = Request.Builder().url("$baseUrl$path")
-        token?.let { requestBuilder.addHeader("Authorization", "Bearer $it") }
+        tokenProvider()?.let { requestBuilder.addHeader("Authorization", "Bearer $it") }
         val mediaType = "application/json".toMediaType()
         when (method) {
             "POST" -> requestBuilder.post((body ?: "{}").toRequestBody(mediaType))

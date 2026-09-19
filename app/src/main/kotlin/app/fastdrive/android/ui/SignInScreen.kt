@@ -41,7 +41,8 @@ fun SignInScreen(
     androidx.compose.runtime.LaunchedEffect(attempt) {
         state = SignInState.Loading
         try {
-            val deviceCode = api.deviceCode(name = "Android")
+            val deviceName = "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}"
+            val deviceCode = api.deviceCode(name = deviceName)
             state = SignInState.AwaitingApproval(deviceCode)
             while (true) {
                 delay(2500)
@@ -49,7 +50,17 @@ fun SignInScreen(
                 when (poll.status) {
                     "approved" -> {
                         tokenStore.setToken(poll.token)
-                        onSignedIn()
+                        // Confirm the new token actually works before leaving sign-in — a token
+                        // that doesn't authenticate shouldn't be treated as a successful sign-in.
+                        try {
+                            api.whoami()
+                            onSignedIn()
+                        } catch (e: Exception) {
+                            tokenStore.clear()
+                            state = SignInState.Error(
+                                (e as? ApiException)?.message ?: "Signed in, but couldn't verify the token. Try again.",
+                            )
+                        }
                         return@LaunchedEffect
                     }
                     "gone" -> {
