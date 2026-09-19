@@ -3,19 +3,19 @@ package app.fastdrive.android
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import app.fastdrive.android.api.DriveApi
 import app.fastdrive.android.auth.TokenStore
+import app.fastdrive.android.data.AppDatabase
+import app.fastdrive.android.ui.FileListScreen
+import app.fastdrive.android.ui.FileListViewModel
 import app.fastdrive.android.ui.SignInScreen
 
 // TODO(Task 4/5): move this to a build config / settings screen instead of hardcoding.
@@ -27,6 +27,7 @@ class MainActivity : ComponentActivity() {
 
         val tokenStore = TokenStore(applicationContext)
         val api = DriveApi(baseUrl = API_BASE_URL, token = tokenStore.getToken())
+        val database = AppDatabase.get(applicationContext)
 
         setContent {
             MaterialTheme {
@@ -48,20 +49,14 @@ class MainActivity : ComponentActivity() {
                             )
                         }
                         composable("files") {
-                            // Task 4 replaces this with the real file list screen.
-                            PlaceholderScreen()
+                            val fileListViewModel: FileListViewModel = viewModel(
+                                factory = FileListViewModel.Factory(api, database, applicationContext),
+                            )
+                            FileListScreen(viewModel = fileListViewModel)
                         }
                     }
                 }
             }
         }
     }
-}
-
-@Composable
-fun PlaceholderScreen() {
-    Text(
-        text = "FastDrive",
-        modifier = Modifier.fillMaxSize().wrapContentSize(Alignment.Center),
-    )
 }

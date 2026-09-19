@@ -4,6 +4,7 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
+    alias(libs.plugins.ksp)
 }
 
 android {
@@ -32,6 +33,12 @@ android {
     buildFeatures {
         compose = true
     }
+
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+        }
+    }
 }
 
 kotlin {
@@ -53,6 +60,13 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.security.crypto)
     implementation(libs.navigation.compose)
+    implementation(libs.lifecycle.viewmodel.compose)
+    implementation(libs.room.runtime)
+    implementation(libs.room.ktx)
+    ksp(libs.room.compiler)
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.serialization.json)
+    testImplementation(libs.room.testing)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.androidx.test.core)
 }
