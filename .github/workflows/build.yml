@@ -1,0 +1,41 @@
+name: FastDrive Android build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      - run: ./gradlew test
+      - run: ./gradlew assembleDebug
+      - name: Locate the built APK
+        id: apk
+        shell: bash
+        run: |
+          apk_path=$(find app/build/outputs/apk/debug -name "*.apk" | head -n1)
+          if [ -z "$apk_path" ]; then
+            echo "::error::no APK found under app/build/outputs/apk/debug"
+            exit 1
+          fi
+          echo "path=$apk_path" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastdrive-android-debug
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
