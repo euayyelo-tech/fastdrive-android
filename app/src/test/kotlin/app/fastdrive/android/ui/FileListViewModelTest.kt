@@ -25,6 +25,7 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import java.util.concurrent.Executor
 
 /** A plain in-memory fake, so tests don't need a real TokenStore — Robolectric's JVM has no
  *  AndroidKeyStore provider, so constructing EncryptedSharedPreferences there throws. */
@@ -55,8 +56,15 @@ class FileListViewModelTest {
     fun setUp() {
         Dispatchers.setMain(dispatcher)
         context = ApplicationProvider.getApplicationContext()
+        // Room normally runs suspend DAO queries on its own executor/thread pool, which the test
+        // coroutine dispatcher's advanceUntilIdle() doesn't know about and won't wait for. Running
+        // both the query and transaction executors immediately/synchronously on the calling thread
+        // keeps everything on the single test dispatcher so advanceUntilIdle() is deterministic.
+        val immediateExecutor = Executor { command -> command.run() }
         database = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
             .allowMainThreadQueries()
+            .setQueryExecutor(immediateExecutor)
+            .setTransactionExecutor(immediateExecutor)
             .build()
         tokenStore = FakeTokenAccess()
     }
