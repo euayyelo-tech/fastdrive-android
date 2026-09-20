@@ -1,5 +1,7 @@
 package app.fastdrive.android.sync
 
+import android.Manifest
+import android.app.Application
 import android.app.NotificationManager
 import android.content.Context
 import android.net.Uri
@@ -89,7 +91,10 @@ class PeriodicSyncWorkerTest {
 
     @Test
     fun `does not post a sync notification when paused at the time of posting`() = runBlocking {
-        val context = ApplicationProvider.getApplicationContext<Context>()
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        // Granted so this test actually exercises the pause guard rather than passing trivially
+        // because the permission check alone would already block the notification either way.
+        shadowOf(context).grantPermissions(Manifest.permission.POST_NOTIFICATIONS)
         SyncSettings(context).setPauseCondition(PauseCondition.Manual)
         val worker = buildWorker { SyncResult(uploaded = 3) }
 
@@ -104,7 +109,12 @@ class PeriodicSyncWorkerTest {
 
     @Test
     fun `posts a sync notification for an active result when not paused`() = runBlocking {
-        val context = ApplicationProvider.getApplicationContext<Context>()
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        // POST_NOTIFICATIONS isn't granted by default under Robolectric on API 33+; without this,
+        // postSyncNotification's own permission check would skip posting regardless of the pause
+        // guard this test means to prove, making the assertion below trivially pass for the wrong
+        // reason.
+        shadowOf(context).grantPermissions(Manifest.permission.POST_NOTIFICATIONS)
         val worker = buildWorker { SyncResult(uploaded = 3) }
 
         val result = worker.doWork()

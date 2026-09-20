@@ -85,9 +85,12 @@ class SyncSettingsTest {
 
     @Test
     fun `timer pause condition round-trips through storage`() {
-        settings.setPauseCondition(PauseCondition.Timer(resumeAtMillis = 123456789L))
+        // A future timestamp — Finding #5 (Phase 4 fix round) makes an already-past resumeAtMillis
+        // self-heal to not-paused, so a plain round-trip test needs one that hasn't elapsed yet.
+        val resumeAtMillis = System.currentTimeMillis() + 123456789L
+        settings.setPauseCondition(PauseCondition.Timer(resumeAtMillis))
 
-        assertEquals(PauseCondition.Timer(123456789L), settings.getPauseCondition())
+        assertEquals(PauseCondition.Timer(resumeAtMillis), settings.getPauseCondition())
         assertTrue(settings.isPaused())
     }
 
@@ -128,13 +131,15 @@ class SyncSettingsTest {
 
     @Test
     fun `switching pause condition types does not leak the previous type's fields`() {
+        // A future timestamp — see the round-trip test above for why (Finding #5 self-heal).
+        val resumeAtMillis = System.currentTimeMillis() + 999_000L
         settings.setPauseCondition(PauseCondition.SpecificWifi(ssid = "HomeWifi"))
-        settings.setPauseCondition(PauseCondition.Timer(resumeAtMillis = 999L))
+        settings.setPauseCondition(PauseCondition.Timer(resumeAtMillis))
 
         // If the old SSID key survived, getPauseCondition would still be internally consistent
         // (it only reads the fields for the current type tag), but round-tripping back to
         // SpecificWifi should not resurrect the old ssid value either.
-        assertEquals(PauseCondition.Timer(999L), settings.getPauseCondition())
+        assertEquals(PauseCondition.Timer(resumeAtMillis), settings.getPauseCondition())
 
         settings.setPauseCondition(PauseCondition.AnyWifi)
         settings.setPauseCondition(PauseCondition.SpecificWifi(ssid = "NewWifi"))
