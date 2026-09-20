@@ -31,6 +31,11 @@ class DriveApi(
     private val client: OkHttpClient = OkHttpClient(),
 ) : DownloadUrlProvider {
     private val json = Json { ignoreUnknownKeys = true }
+    // Distinct from `json` (encodeDefaults defaults to true, which is fine for the fixed-shape
+    // request bodies elsewhere in this file) — UpdateFileRequest's fields are individually
+    // optional per the server's PATCH contract, so a field the caller left null must be OMITTED
+    // from the JSON entirely, not sent as an explicit `null`.
+    private val jsonOmitNulls = Json { explicitNulls = false }
 
     private inline fun <reified T> call(path: String, method: String = "GET", body: String? = null): T {
         val requestBuilder = Request.Builder().url("$baseUrl$path")
@@ -38,6 +43,8 @@ class DriveApi(
         val mediaType = "application/json".toMediaType()
         when (method) {
             "POST" -> requestBuilder.post((body ?: "{}").toRequestBody(mediaType))
+            "PATCH" -> requestBuilder.patch((body ?: "{}").toRequestBody(mediaType))
+            "DELETE" -> requestBuilder.delete()
             "GET" -> requestBuilder.get()
             else -> throw IllegalArgumentException("unsupported method $method")
         }
@@ -122,6 +129,21 @@ class DriveApi(
     suspend fun uploadAbort(id: String, uploadId: String) {
         withContext(Dispatchers.IO) {
             runCatching { call<Unit>("/api/files/$id/abort", "POST", json.encodeToString(mapOf("uploadId" to uploadId))) }
+        }
+    }
+
+    // Sync orchestration (Task 6): DELETE/PATCH /api/files/{id}, matching desktop's
+    // engine/api.ts delete()/move()/rename() field-for-field — Phase 1/2 only ever needed
+    // download/upload, so these two didn't exist yet.
+    suspend fun deleteFile(id: String) {
+        withContext(Dispatchers.IO) { call<Unit>("/api/files/$id", "DELETE") }
+    }
+
+    /** Covers both desktop's move() (folder set, name optional) and rename() (name only) —
+     *  the wire shape is identical PATCH /api/files/{id}, just with different fields present. */
+    suspend fun updateFile(id: String, folder: String? = null, name: String? = null) {
+        withContext(Dispatchers.IO) {
+            call<Unit>("/api/files/$id", "PATCH", jsonOmitNulls.encodeToString(UpdateFileRequest(folder, name)))
         }
     }
 }

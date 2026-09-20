@@ -173,6 +173,63 @@ class DriveApiTest {
         assertEquals("""{"uploadId":"up_1","from":1,"to":32}""", body)
     }
 
+    @Test
+    fun `deleteFile sends a DELETE to files slash id with no body`() = runBlocking {
+        var seenMethod: String? = null
+        var seenPath: String? = null
+        val client = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                seenMethod = chain.request().method
+                seenPath = chain.request().url.encodedPath
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body("{}".toResponseBody("application/json".toMediaType()))
+                    .build()
+            }
+            .build()
+        val api = DriveApi(baseUrl = "https://example.com", client = client)
+
+        api.deleteFile("f1")
+
+        assertEquals("DELETE", seenMethod)
+        assertEquals("/api/files/f1", seenPath)
+    }
+
+    /**
+     * Task 6's MoveRemote/MoveLocal actions rely on `updateFile` sending only the fields the
+     * caller actually provided — a null `name` for a pure move must be OMITTED from the JSON, not
+     * sent as an explicit `null`, matching the server's optional-field PATCH contract (the same
+     * class of bug the multipart-as-a-string issue was: an untested request body shape).
+     */
+    @Test
+    fun `updateFile PATCHes files slash id and omits a null name entirely`() = runBlocking {
+        var body: String? = null
+        val client = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val buffer = Buffer()
+                chain.request().body?.writeTo(buffer)
+                body = buffer.readUtf8()
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body("{}".toResponseBody("application/json".toMediaType()))
+                    .build()
+            }
+            .build()
+        val api = DriveApi(baseUrl = "https://example.com", client = client)
+
+        api.updateFile("f1", folder = "docs")
+        assertEquals("""{"folder":"docs"}""", body)
+
+        api.updateFile("f1", folder = "docs", name = "renamed.txt")
+        assertEquals("""{"folder":"docs","name":"renamed.txt"}""", body)
+    }
+
     /**
      * Confirms the tokenProvider-based constructor still deserializes real responses correctly,
      * and — the actual point of the refactor — reads the token fresh on every call rather than

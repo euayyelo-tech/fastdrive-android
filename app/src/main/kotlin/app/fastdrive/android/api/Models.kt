@@ -135,3 +135,10 @@ data class UploadUrlRequest(
 // typed request body sends real JSON numbers instead.
 @Serializable
 data class PartsRequest(val uploadId: String, val from: Int, val to: Int)
+
+// Request body for PATCH /api/files/[id] (Task 6's sync orchestration: MoveRemote/MoveLocal
+// actions). Matches desktop's move()/rename() bodies: `folder` is present for a move, `name` is
+// present whenever the name changes too — DriveApi.updateFile() encodes this with a Json instance
+// that omits null fields entirely rather than sending them as explicit `null`s.
+@Serializable
+data class UpdateFileRequest(val folder: String? = null, val name: String? = null)

@@ -15,7 +15,6 @@ import app.fastdrive.android.api.DownloadUrlProvider
 import app.fastdrive.android.api.DriveApi
 import app.fastdrive.android.auth.TokenStore
 import okhttp3.OkHttpClient
-import okhttp3.Request
 import java.io.File
 
 private const val CHANNEL_ID = "fastdrive_downloads"
@@ -65,34 +64,23 @@ class DownloadWorker @JvmOverloads constructor(
         return try {
             val token = tokenProvider()
             val api = apiFactory(baseUrl, token)
-            val downloadInfo = api.downloadUrl(fileId)
-            if (downloadInfo.vault) {
-                notifyFailure(fileName, "Vault files can't be downloaded yet")
+
+            val downloadsDir = File(applicationContext.filesDir, "downloads").apply { mkdirs() }
+            val destination = File(downloadsDir, fileName)
+            // Belt-and-braces: confirm the resolved path is still inside downloadsDir before
+            // writing anything, in case some other trick got a "/" or ".." past the strip above.
+            val downloadsDirCanonical = downloadsDir.canonicalFile
+            val destinationCanonical = destination.canonicalFile
+            if (!destinationCanonical.path.startsWith(downloadsDirCanonical.path + File.separator)) {
+                notifyFailure(fileName, "Download failed")
                 return Result.failure()
             }
 
-            val client = OkHttpClient()
-            val request = Request.Builder().url(downloadInfo.url).build()
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful || response.body == null) {
-                    notifyFailure(fileName, "Download failed")
-                    return Result.failure()
-                }
-                val downloadsDir = File(applicationContext.filesDir, "downloads").apply { mkdirs() }
-                val destination = File(downloadsDir, fileName)
-
-                // Belt-and-braces: confirm the resolved path is still inside downloadsDir before
-                // writing anything, in case some other trick got a "/" or ".." past the strip above.
-                val downloadsDirCanonical = downloadsDir.canonicalFile
-                val destinationCanonical = destination.canonicalFile
-                if (!destinationCanonical.path.startsWith(downloadsDirCanonical.path + File.separator)) {
-                    notifyFailure(fileName, "Download failed")
-                    return Result.failure()
-                }
-
-                response.body!!.byteStream().use { input ->
-                    destination.outputStream().use { output -> input.copyTo(output) }
-                }
+            try {
+                FileDownloader.download(api, OkHttpClient(), fileId) { destination.outputStream() }
+            } catch (e: VaultFileException) {
+                notifyFailure(fileName, "Vault files can't be downloaded yet")
+                return Result.failure()
             }
             Result.success()
         } catch (e: Exception) {
