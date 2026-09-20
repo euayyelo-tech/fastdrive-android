@@ -29,7 +29,7 @@ class ContentResolverFileAccessTest {
             sortOrder: String?,
         ): Cursor {
             val cursor = MatrixCursor(arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE))
-            cursor.addRow(arrayOf("report.pdf", 4096L))
+            cursor.addRow(arrayOf<Any>("report.pdf", 4096L))
             return cursor
         }
 
