@@ -60,7 +60,7 @@ class PauseGatingTest {
         InstantSyncService.applySettings(context, syncSettings)
         assertTrue(
             "instant service should be started before pausing",
-            shadowOf(context).peekNextStartedService()?.component?.className ==
+            shadowOf(context).nextStartedService?.component?.className ==
                 InstantSyncService::class.java.name,
         )
 
