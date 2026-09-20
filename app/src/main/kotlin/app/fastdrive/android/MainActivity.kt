@@ -22,6 +22,7 @@ import androidx.navigation.compose.rememberNavController
 import app.fastdrive.android.api.DriveApi
 import app.fastdrive.android.auth.TokenStore
 import app.fastdrive.android.data.AppDatabase
+import app.fastdrive.android.sync.PeriodicSyncWorker
 import app.fastdrive.android.sync.SyncSettings
 import app.fastdrive.android.ui.FileListScreen
 import app.fastdrive.android.ui.FileListViewModel
@@ -53,6 +54,11 @@ class MainActivity : ComponentActivity() {
         val api = DriveApi(baseUrl = BuildConfig.API_BASE_URL, tokenProvider = { tokenStore.getToken() })
         val database = AppDatabase.get(applicationContext)
         val syncSettings = SyncSettings(applicationContext)
+        // Re-asserts whatever schedule the user last chose on every app start — cheap thanks to
+        // ExistingPeriodicWorkPolicy.KEEP, and the only place that runs before any sync_settings
+        // screen visit, so a battery-friendly choice from a previous install/session actually
+        // takes effect again after a process restart.
+        PeriodicSyncWorker.applySettings(applicationContext, syncSettings)
 
         setContent {
             MaterialTheme {

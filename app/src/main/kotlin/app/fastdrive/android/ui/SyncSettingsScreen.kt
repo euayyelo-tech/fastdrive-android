@@ -24,13 +24,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import app.fastdrive.android.sync.PeriodicSyncWorker
 import app.fastdrive.android.sync.SyncMode
 import app.fastdrive.android.sync.SyncSettings
 
 /**
- * Lets the user pick the folder FastDrive syncs into and the sync-frequency mode. Neither choice
- * starts any actual sync work here — Tasks 7-8 read [SyncSettings] to decide which trigger
- * mechanism (WorkManager vs. a foreground service) to run.
+ * Lets the user pick the folder FastDrive syncs into and the sync-frequency mode. Choosing a
+ * folder or switching to [SyncMode.BATTERY_FRIENDLY] here (re)enqueues Task 7's periodic
+ * WorkManager sync via [PeriodicSyncWorker.applySettings]; switching to [SyncMode.INSTANT] cancels
+ * it. Task 8's foreground service for INSTANT mode is still out of scope here.
  */
 @Composable
 fun SyncSettingsScreen(syncSettings: SyncSettings) {
@@ -50,6 +52,7 @@ fun SyncSettingsScreen(syncSettings: SyncSettings) {
             )
             syncSettings.setFolderUri(uri)
             folderUri = uri
+            PeriodicSyncWorker.applySettings(context, syncSettings)
         }
     }
 
@@ -73,8 +76,8 @@ fun SyncSettingsScreen(syncSettings: SyncSettings) {
             onSelect = {
                 syncMode = SyncMode.BATTERY_FRIENDLY
                 syncSettings.setSyncMode(SyncMode.BATTERY_FRIENDLY)
-                // TODO(Tasks 7-8): stop the instant-sync foreground service (if running) and
-                // (re)schedule the periodic WorkManager sync request for this mode.
+                // TODO(Task 8): stop the instant-sync foreground service if it's running.
+                PeriodicSyncWorker.applySettings(context, syncSettings)
             },
         )
         SyncModeOption(
@@ -83,8 +86,8 @@ fun SyncSettingsScreen(syncSettings: SyncSettings) {
             onSelect = {
                 syncMode = SyncMode.INSTANT
                 syncSettings.setSyncMode(SyncMode.INSTANT)
-                // TODO(Tasks 7-8): cancel the periodic WorkManager sync request (if scheduled)
-                // and start the foreground service that watches for changes instantly.
+                PeriodicSyncWorker.applySettings(context, syncSettings)
+                // TODO(Task 8): start the foreground service that watches for changes instantly.
             },
         )
     }

@@ -44,9 +44,10 @@ class SyncSettings(context: Context) {
 
     fun setSyncMode(mode: SyncMode) {
         prefs.edit().putString(KEY_SYNC_MODE, mode.name).apply()
-        // TODO(Tasks 7-8): switching modes here should also start/stop the corresponding trigger
-        // mechanism (WorkManager periodic work for BATTERY_FRIENDLY vs. a foreground service for
-        // INSTANT). This task only persists the choice; the actual mechanism swap is out of scope.
+        // Task 7 wires the actual WorkManager periodic-work start/stop at the call sites
+        // (SyncSettingsScreen, MainActivity startup) via PeriodicSyncWorker.applySettings —
+        // this class only persists the choice.
+        // TODO(Task 8): start/stop the INSTANT-mode foreground service the same way.
     }
 
     /** The sync engine's own change-feed cursor (Task 6's orchestration reads/writes this around
