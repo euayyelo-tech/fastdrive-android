@@ -10,6 +10,8 @@ import app.fastdrive.android.auth.TokenAccess
 import app.fastdrive.android.auth.TokenStore
 import app.fastdrive.android.auth.handleUnauthorized
 import app.fastdrive.android.auth.isUnauthorized
+import app.fastdrive.android.data.AppDatabase
+import app.fastdrive.android.sync.SyncSettings
 import okhttp3.OkHttpClient
 
 /**
@@ -40,6 +42,9 @@ class UploadWorker @JvmOverloads constructor(
     private val fileAccess: FileAccess = ContentResolverFileAccess(context.contentResolver),
     private val tokenStore: TokenAccess = TokenStore(context.applicationContext),
     private val tokenProvider: () -> String? = { tokenStore.getToken() },
+    // Only needed to hand to the shared handleUnauthorized() sign-out path (Finding #5) on a 401.
+    private val database: AppDatabase = AppDatabase.get(context.applicationContext),
+    private val syncSettings: SyncSettings = SyncSettings(context.applicationContext),
     private val httpClient: OkHttpClient = OkHttpClient(),
     private val apiFactory: (baseUrl: String, token: String?, client: OkHttpClient) -> DriveApi =
         { baseUrl, token, client -> DriveApi(baseUrl, tokenProvider = { token }, client = client) },
@@ -67,9 +72,9 @@ class UploadWorker @JvmOverloads constructor(
      * else is a permanent failure whose message is surfaced verbatim (never paraphrased) via
      * `outputData` so the UI can show the server's actual rejection reason.
      */
-    private fun failureFor(e: Exception): Result {
+    private suspend fun failureFor(e: Exception): Result {
         if (isUnauthorized(e)) {
-            handleUnauthorized(tokenStore)
+            handleUnauthorized(tokenStore, database, syncSettings)
             return Result.failure(workDataOf("error" to "You've been signed out.", "auth_error" to true))
         }
         if (retryable(statusOf(e))) {

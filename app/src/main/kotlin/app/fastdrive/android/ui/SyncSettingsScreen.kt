@@ -55,6 +55,13 @@ fun SyncSettingsScreen(syncSettings: SyncSettings) {
             syncSettings.setFolderUri(uri)
             folderUri = uri
             PeriodicSyncWorker.applySettings(context, syncSettings)
+            // Finding #1: if the user already had Instant mode selected before ever picking a
+            // folder, InstantSyncService.applySettings() was never called for it (only
+            // PeriodicSyncWorker was) — instant mode would silently never start until the next
+            // app restart happened to re-assert it from MainActivity.onCreate(). Only the folder
+            // changed here, not the mode itself, so calling both in either order is safe; matching
+            // the mode-switch callbacks below is just for consistency.
+            InstantSyncService.applySettings(context, syncSettings)
         }
     }
 

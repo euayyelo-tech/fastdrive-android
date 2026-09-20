@@ -91,6 +91,12 @@ interface BaseDao {
 
     @Query("DELETE FROM sync_base WHERE path = :path")
     suspend fun deleteByPath(path: String)
+
+    /** Wipes the whole table — used by [app.fastdrive.android.auth.handleUnauthorized] on
+     *  sign-out so a stale base from the previous account never gets reconciled against a new
+     *  account's remote snapshot. */
+    @Query("DELETE FROM sync_base")
+    suspend fun deleteAll()
 }
 
 @Dao
@@ -115,6 +121,11 @@ interface RemoteDao {
 
     @Query("DELETE FROM sync_remote WHERE id = :id")
     suspend fun deleteById(id: String)
+
+    /** Wipes the whole table — see [BaseDao.deleteAll]'s doc comment; the same sign-out reasoning
+     *  applies to `sync_remote`. */
+    @Query("DELETE FROM sync_remote")
+    suspend fun deleteAll()
 }
 
 @Dao
@@ -137,4 +148,10 @@ interface HashDao {
     /** Lets the orchestration layer skip re-hashing a file whose (size, mtime) haven't changed. */
     @Query("SELECT * FROM sync_hashes WHERE path = :path AND size = :size AND mtimeMs = :mtimeMs")
     suspend fun findHash(path: String, size: Long, mtimeMs: Long): HashEntry?
+
+    /** Wipes the whole table — see [BaseDao.deleteAll]'s doc comment; a stale hash cache from a
+     *  previous account is harmless on its own (it's just a re-hash optimization) but is cleared
+     *  alongside the other two tables for a clean account boundary. */
+    @Query("DELETE FROM sync_hashes")
+    suspend fun deleteAll()
 }

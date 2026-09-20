@@ -59,9 +59,38 @@ class SyncSettings(context: Context) {
         prefs.edit().putString(KEY_REMOTE_CURSOR, json.encodeToString(cursor)).apply()
     }
 
+    /**
+     * Called from the shared sign-out path ([app.fastdrive.android.auth.handleUnauthorized]) to
+     * wipe everything here that was configured in the context of the account that just signed
+     * out: the folder pick, this engine's own remote cursor, and Phase 1's separate
+     * `changes_cursor` (`FileListViewModel`'s own key, but the SAME underlying prefs file — see
+     * this class's own doc comment).
+     *
+     * The folder pick is, in principle, account-agnostic (it is just a path on disk), but it was
+     * chosen while a specific account was signed in. Clearing it here is the safer of two
+     * reasonable choices: it forces a fresh pick + a fresh full sync the next time ANY account
+     * signs in, with no risk of a new account's remote snapshot being reconciled (via a stale
+     * `sync_base`, cleared separately by [handleUnauthorized] itself) against a folder that may
+     * hold a completely different account's files. The alternative (keep the folder, only wipe
+     * the sync tables/cursors) would save the next sign-in a folder re-pick, but silently reuses
+     * a folder chosen for someone else — not worth the ambiguity.
+     */
+    fun clearAccountState() {
+        prefs.edit()
+            .remove(KEY_FOLDER_URI)
+            .remove(KEY_REMOTE_CURSOR)
+            .remove(KEY_CHANGES_CURSOR_SHARED_WITH_FILE_LIST_VIEW_MODEL)
+            .apply()
+    }
+
     private companion object {
         const val KEY_FOLDER_URI = "sync_folder_uri"
         const val KEY_SYNC_MODE = "sync_mode"
         const val KEY_REMOTE_CURSOR = "sync_remote_cursor"
+
+        /** `FileListViewModel`'s own private `CURSOR_KEY` constant, duplicated here (not
+         *  imported — it's `private` and lives in the `ui` package) because both classes agree by
+         *  convention on the same underlying prefs file, `"fastdrive_sync_prefs"`. */
+        const val KEY_CHANGES_CURSOR_SHARED_WITH_FILE_LIST_VIEW_MODEL = "changes_cursor"
     }
 }

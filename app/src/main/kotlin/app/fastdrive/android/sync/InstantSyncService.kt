@@ -1,5 +1,6 @@
 package app.fastdrive.android.sync
 
+import android.app.ForegroundServiceStartNotAllowedException
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
@@ -8,8 +9,10 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -64,7 +67,21 @@ class InstantSyncService : Service() {
         )
         scope.launch {
             while (true) {
-                runPass(applicationContext)
+                // Finding #6: an uncaught exception from runPass() used to kill this loop
+                // coroutine silently while the "FastDrive is syncing" notification stayed up,
+                // misleading the user into thinking sync was still happening. A real cancellation
+                // (the service stopping) must still propagate normally; everything else is logged
+                // and the loop keeps going — the next tick, 30s from now, is this mechanism's own
+                // retry, same philosophy as PeriodicSyncWorker's periodic tick.
+                try {
+                    val result = runPass(applicationContext)
+                    // Finding #4: surface what this pass actually did instead of discarding it.
+                    logSyncResult(result)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(SYNC_LOG_TAG, "instant sync pass failed", e)
+                }
                 delay(SYNC_INTERVAL_MS)
             }
         }
@@ -112,7 +129,16 @@ class InstantSyncService : Service() {
 
         fun start(context: Context) {
             val intent = Intent(context, InstantSyncService::class.java)
-            context.startForegroundService(intent)
+            try {
+                context.startForegroundService(intent)
+            } catch (e: ForegroundServiceStartNotAllowedException) {
+                // Finding #9: API 31+ can refuse a foreground-service start under certain
+                // conditions (e.g. no active foreground exemption while starting from the
+                // background). This is reachable from MainActivity.onCreate() re-asserting a
+                // previously-chosen INSTANT mode on a cold start — better to log and leave instant
+                // sync not running than crash the whole app on startup.
+                Log.w(SYNC_LOG_TAG, "couldn't start the instant sync foreground service", e)
+            }
         }
 
         fun stop(context: Context) {

@@ -81,22 +81,31 @@ object LocalScanner {
                     visit(child, childPath)
                     continue
                 }
-                val size = child.length
-                val mtimeMs = child.lastModified
-                val cached = hashDao.findHash(childPath, size, mtimeMs)
-                val sha256 = if (cached != null) {
-                    cached.sha256
-                } else {
-                    val hash = sha256Hex(fileAccess, child.uri)
-                    hashDao.upsert(HashEntry(path = childPath, size = size, mtimeMs = mtimeMs, sha256 = hash))
-                    hash
+                // Finding #7: reading/hashing THIS one file (a permissions hiccup, a flaky
+                // provider, ...) must never abort the whole scan — that would abort every future
+                // sync pass too, since SyncOrchestrator treats a scan() throwing as fatal to the
+                // pass. Reuse the same `skipped` mechanism unsyncable() paths already use instead
+                // of propagating, and keep walking the rest of the tree.
+                try {
+                    val size = child.length
+                    val mtimeMs = child.lastModified
+                    val cached = hashDao.findHash(childPath, size, mtimeMs)
+                    val sha256 = if (cached != null) {
+                        cached.sha256
+                    } else {
+                        val hash = sha256Hex(fileAccess, child.uri)
+                        hashDao.upsert(HashEntry(path = childPath, size = size, mtimeMs = mtimeMs, sha256 = hash))
+                        hash
+                    }
+                    entries[childPath] = Entry(
+                        path = childPath,
+                        size = size,
+                        sha256 = sha256,
+                        mtime = Instant.ofEpochMilli(mtimeMs).toString(),
+                    )
+                } catch (e: Exception) {
+                    skipped.add(childPath)
                 }
-                entries[childPath] = Entry(
-                    path = childPath,
-                    size = size,
-                    sha256 = sha256,
-                    mtime = Instant.ofEpochMilli(mtimeMs).toString(),
-                )
             }
         }
 

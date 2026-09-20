@@ -13,6 +13,7 @@ import app.fastdrive.android.auth.handleUnauthorized
 import app.fastdrive.android.auth.isUnauthorized
 import app.fastdrive.android.data.AppDatabase
 import app.fastdrive.android.data.CachedFile
+import app.fastdrive.android.sync.SyncSettings
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -40,6 +41,9 @@ class FileListViewModel(
 
     private val prefs = context.applicationContext.getSharedPreferences(CURSOR_PREFS, Context.MODE_PRIVATE)
     private val json = Json { ignoreUnknownKeys = true }
+    // Only needed to hand to the shared handleUnauthorized() sign-out path (Finding #5) — this
+    // view model never reads/writes sync settings itself.
+    private val syncSettings = SyncSettings(context)
 
     val files: StateFlow<List<CachedFile>> = database.cachedFileDao().observeAll()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -96,7 +100,7 @@ class FileListViewModel(
                 _refreshError.value = null
             }.onFailure { e ->
                 if (isUnauthorized(e)) {
-                    handleUnauthorized(tokenStore)
+                    handleUnauthorized(tokenStore, database, syncSettings)
                     _signedOut.value = true
                 } else {
                     _refreshError.value = e.message ?: "Couldn't refresh files."

@@ -5,12 +5,14 @@ import app.fastdrive.android.api.DriveApi
 import app.fastdrive.android.api.PartETag
 import app.fastdrive.android.api.UploadUrlResponse
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -112,7 +114,14 @@ object FileUploader {
         } catch (e: Exception) {
             // Best-effort per DriveApi.uploadAbort's own contract — only meaningful for the
             // multipart path, but calling it whenever an uploadId exists is harmless.
-            start.uploadId?.let { uploadId -> api.uploadAbort(start.id, uploadId) }
+            //
+            // Finding #9: wrapped in NonCancellable so a coroutine CANCELLATION (e — the very
+            // exception caught here) doesn't also cancel THIS cleanup call. Without it, the abort
+            // request would immediately notice the surrounding coroutine is already cancelled and
+            // skip going out over the network at all, orphaning a multipart upload server-side.
+            start.uploadId?.let { uploadId ->
+                withContext(NonCancellable) { api.uploadAbort(start.id, uploadId) }
+            }
             throw e
         }
     }

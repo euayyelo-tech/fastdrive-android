@@ -40,7 +40,10 @@ class PeriodicSyncWorker @JvmOverloads constructor(
 
     override suspend fun doWork(): Result {
         return try {
-            runPass(applicationContext)
+            val result = runPass(applicationContext)
+            // Finding #4: surface what this pass actually did — counts, every skipped path, every
+            // failure's own message — rather than silently discarding the SyncResult.
+            logSyncResult(result)
             Result.success()
         } catch (e: Exception) {
             if (retryable(statusOf(e))) Result.retry() else Result.failure()

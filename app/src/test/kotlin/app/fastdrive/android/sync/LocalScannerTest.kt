@@ -148,6 +148,34 @@ class LocalScannerTest {
     }
 
     @Test
+    fun `a file that throws while being read is skipped, not fatal to the scan`() = runBlocking {
+        // Finding #7: a permissions hiccup or a flaky provider reading/hashing ONE file must not
+        // abort the whole scan (which SyncOrchestrator would otherwise treat as fatal to the
+        // entire pass, forever, until that one file's problem somehow resolves itself).
+        val goodUri = uriFor("good.txt")
+        val badUri = uriFor("bad.txt")
+        val hashDao = FakeHashDao()
+        val fileAccess = object : FileAccess {
+            override fun stat(uri: Uri): PickedFile = throw UnsupportedOperationException("not needed for scanning")
+            override fun openStream(uri: Uri): InputStream {
+                if (uri == badUri) throw java.io.IOException("permission denied")
+                return ByteArrayInputStream("hi".toByteArray())
+            }
+        }
+        val root = dir(
+            "root",
+            file("bad.txt", size = 4, mtimeMs = 500, uri = badUri),
+            file("good.txt", size = 2, mtimeMs = 500, uri = goodUri),
+        )
+
+        val result = LocalScanner.walk(root, hashDao, fileAccess)
+
+        assertTrue(result.snapshot.containsKey("good.txt"))
+        assertNull(result.snapshot["bad.txt"])
+        assertEquals(listOf("bad.txt"), result.skipped)
+    }
+
+    @Test
     fun `builds relative paths for nested folders`() = runBlocking {
         val uri = uriFor("sub/deep.txt")
         val hashDao = FakeHashDao()

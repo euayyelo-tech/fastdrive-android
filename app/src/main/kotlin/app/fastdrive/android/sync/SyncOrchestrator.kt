@@ -2,6 +2,7 @@ package app.fastdrive.android.sync
 
 import android.content.Context
 import android.os.Build
+import android.util.Log
 import app.fastdrive.android.BuildConfig
 import app.fastdrive.android.api.DriveApi
 import app.fastdrive.android.auth.TokenStore
@@ -13,7 +14,17 @@ import app.fastdrive.android.upload.ContentResolverFileAccess
 import app.fastdrive.android.upload.FileAccess
 import app.fastdrive.android.upload.FileUploader
 import java.time.Instant
+import java.util.concurrent.TimeUnit
 import okhttp3.OkHttpClient
+
+/** Log tag [PeriodicSyncWorker]/[InstantSyncService] also use when logging a [SyncResult] via
+ *  [logSyncResult] — kept as one constant so a logcat filter catches both triggers. */
+const val SYNC_LOG_TAG = "FastDriveSync"
+
+/** How long a trashed file (Finding #8) is kept in `.fastdrive-trash` before [SyncOrchestrator]
+ *  automatically prunes it — a named constant rather than a magic number inline. Not exposed as a
+ *  user setting; this is a cheap "don't grow forever unnoticed" mitigation, not a full trash UI. */
+private const val TRASH_RETENTION_DAYS = 30L
 
 /**
  * Ties together Tasks 1-5 into one sync pass: read `base` (Task 2), scan the local folder (Task
@@ -30,14 +41,36 @@ import okhttp3.OkHttpClient
  */
 object SyncOrchestrator {
 
+    // Finding #9a: previously a fresh OkHttpClient() (its own connection pool, thread pool, etc.)
+    // was built on EVERY pass. In instant mode (30s interval, InstantSyncService.SYNC_INTERVAL_MS)
+    // that was a brand-new pool every 30 seconds. Built once, lazily, and reused across every pass
+    // for the process's lifetime instead.
+    private val sharedHttpClient: OkHttpClient by lazy { OkHttpClient() }
+
     suspend fun runOnePass(context: Context): SyncResult {
+        // Finding #6: the whole body is now wrapped so a single unexpected exception ANYWHERE in
+        // it (constructing SyncSettings/AppDatabase/TokenStore/DriveApi, plan() itself, trash
+        // pruning, ...) becomes a recorded SyncResult.failed entry instead of an uncaught
+        // exception — which, for InstantSyncService's poll loop, used to kill the loop coroutine
+        // silently while its "FastDrive is syncing" notification stayed up. The specific try/
+        // catches below are kept as-is for their nicer per-stage error messages; this is a
+        // catch-all safety net around the parts that had none.
+        return try {
+            runOnePassInner(context)
+        } catch (e: Exception) {
+            Log.w(SYNC_LOG_TAG, "sync pass aborted by an unexpected exception", e)
+            SyncResult(failed = listOf(SyncFailure(path = "", message = e.message ?: "Sync was interrupted.")))
+        }
+    }
+
+    private suspend fun runOnePassInner(context: Context): SyncResult {
         val syncSettings = SyncSettings(context)
         val folderUri = syncSettings.getFolderUri()
             ?: return SyncResult(failed = listOf(SyncFailure(path = "", message = "No folder is set to sync.")))
 
         val db = AppDatabase.get(context)
         val tokenStore = TokenStore(context.applicationContext)
-        val httpClient = OkHttpClient()
+        val httpClient = sharedHttpClient
         val api = DriveApi(baseUrl = BuildConfig.API_BASE_URL, tokenProvider = { tokenStore.getToken() }, client = httpClient)
         val fileAccess = ContentResolverFileAccess(context.contentResolver)
 
@@ -46,6 +79,13 @@ object SyncOrchestrator {
         } catch (e: Exception) {
             return SyncResult(failed = listOf(SyncFailure(path = "", message = e.message ?: "Couldn't open the sync folder.")))
         }
+
+        // Finding #8: prune `.fastdrive-trash` of anything older than the retention window at the
+        // start of every pass. Best-effort and non-fatal — a prune failure (e.g. a transient SAF
+        // hiccup) must never block the sync pass itself.
+        runCatching {
+            localStore.pruneTrash(TimeUnit.DAYS.toMillis(TRASH_RETENTION_DAYS))
+        }.onFailure { Log.w(SYNC_LOG_TAG, "trash prune failed", it) }
 
         // Only a failure in building the snapshots themselves (can't read the folder, can't reach
         // the server) aborts the whole pass early — per-action failures below are recorded and
@@ -90,7 +130,7 @@ object SyncOrchestrator {
             // A 401 abandons the whole pass rather than being recorded per-action and continued
             // past — the token is gone, so every remaining action would fail the same way. Same
             // sign-out path `UploadWorker`/`FileListViewModel` already use for a 401 elsewhere.
-            if (isUnauthorized(e)) handleUnauthorized(tokenStore)
+            if (isUnauthorized(e)) handleUnauthorized(tokenStore, db, syncSettings)
             SyncResult(failed = listOf(SyncFailure(path = "", message = e.message ?: "Sync was interrupted.")))
         }
     }
@@ -162,9 +202,33 @@ object SyncOrchestrator {
 
                     is Action.Download -> {
                         val entry = remote.getValue(action.path)
-                        FileDownloader.download(api, httpClient, action.id) { localStore.openForWrite(action.path) }
+                        // Finding #3: openForWrite() now stages bytes in a temp file and
+                        // commitWrite() is what actually moves them into place — an interruption
+                        // partway through (mode switch, process death, network drop) leaves only
+                        // the temp file truncated, never the user's real file.
+                        try {
+                            FileDownloader.download(api, httpClient, action.id) { localStore.openForWrite(action.path) }
+                            localStore.commitWrite(action.path)
+                        } catch (e: Exception) {
+                            localStore.abortWrite(action.path)
+                            throw e
+                        }
+                        // Finding #2: Android's SAF has no way to set the downloaded file's
+                        // on-disk mtime to match the remote's claimed mtime (unlike desktop's
+                        // utimes() call), so base is recorded from the REAL local (size, mtime)
+                        // this write just produced — not the remote entry's claim — while id/rev/
+                        // sha256 (fields only the remote side can supply) still come from `entry`.
+                        // `same()` matches on `rev` first, so this doesn't affect base-vs-remote
+                        // agreement; it's base-vs-a-FUTURE-local-scan agreement (same(base, local))
+                        // this fixes, which is exactly what was spuriously re-uploading files the
+                        // server has no sha256 for (e.g. an un-indexed photo/video).
+                        val stat = localStore.statLocal(action.path)
                         baseDao.upsert(
-                            BaseEntry(path = action.path, id = entry.id, size = entry.size, sha256 = entry.sha256, mtime = entry.mtime, rev = entry.rev),
+                            BaseEntry(
+                                path = action.path, id = entry.id,
+                                size = stat?.size ?: entry.size, sha256 = entry.sha256,
+                                mtime = stat?.mtime ?: entry.mtime, rev = entry.rev,
+                            ),
                         )
                         downloaded++
                     }
@@ -211,9 +275,18 @@ object SyncOrchestrator {
                         // The remote file already moved; the local copy has to follow.
                         if (!localStore.move(action.from, action.to)) error("couldn't move ${action.from} to ${action.to} locally")
                         val entry = remote.getValue(action.to)
+                        // Finding #2: a same-provider rename preserves mtime, but the copy+delete
+                        // fallback DocumentTreeFileStore.move() uses for a provider that doesn't
+                        // support DocumentsContract.moveDocument() creates a brand-new file (a new
+                        // mtime) — re-stat unconditionally rather than assume which path was taken.
+                        val stat = localStore.statLocal(action.to)
                         baseDao.deleteByPath(action.from)
                         baseDao.upsert(
-                            BaseEntry(path = action.to, id = entry.id, size = entry.size, sha256 = entry.sha256, mtime = entry.mtime, rev = entry.rev),
+                            BaseEntry(
+                                path = action.to, id = entry.id,
+                                size = stat?.size ?: entry.size, sha256 = entry.sha256,
+                                mtime = stat?.mtime ?: entry.mtime, rev = entry.rev,
+                            ),
                         )
                         moved++
                     }
@@ -236,9 +309,23 @@ object SyncOrchestrator {
                         baseDao.deleteByPath(action.renamed)
 
                         val remoteEntry = remote.getValue(action.path)
-                        FileDownloader.download(api, httpClient, action.id) { localStore.openForWrite(action.path) }
+                        // Finding #3 + #2: same atomic-write and real-local-stat treatment as a
+                        // plain Action.Download above — this is a download too, just one half of
+                        // a conflict resolution.
+                        try {
+                            FileDownloader.download(api, httpClient, action.id) { localStore.openForWrite(action.path) }
+                            localStore.commitWrite(action.path)
+                        } catch (e: Exception) {
+                            localStore.abortWrite(action.path)
+                            throw e
+                        }
+                        val remoteStat = localStore.statLocal(action.path)
                         baseDao.upsert(
-                            BaseEntry(path = action.path, id = remoteEntry.id, size = remoteEntry.size, sha256 = remoteEntry.sha256, mtime = remoteEntry.mtime, rev = remoteEntry.rev),
+                            BaseEntry(
+                                path = action.path, id = remoteEntry.id,
+                                size = remoteStat?.size ?: remoteEntry.size, sha256 = remoteEntry.sha256,
+                                mtime = remoteStat?.mtime ?: remoteEntry.mtime, rev = remoteEntry.rev,
+                            ),
                         )
 
                         val asideUri = localStore.uriFor(action.renamed)
@@ -373,3 +460,23 @@ data class SyncResult(
     val skipped: List<String> = emptyList(),
     val failed: List<SyncFailure> = emptyList(),
 )
+
+/**
+ * Finding #4: neither [PeriodicSyncWorker] nor [InstantSyncService] did anything with the
+ * [SyncResult] their call to [SyncOrchestrator.runOnePass] returned — logging is the minimum bar
+ * the spec calls for (skipped/failed must be surfaced, failures logged), so both triggers call
+ * this right after `runOnePass()` returns. A summary line always logs; every skipped path and
+ * every failure's own message logs individually (never paraphrased) so `adb logcat` filtered on
+ * [SYNC_LOG_TAG] is enough to diagnose "why didn't my file sync" without a dedicated UI.
+ */
+fun logSyncResult(result: SyncResult) {
+    Log.i(
+        SYNC_LOG_TAG,
+        "sync pass: uploaded=${result.uploaded} downloaded=${result.downloaded} " +
+            "deletedLocal=${result.deletedLocal} deletedRemote=${result.deletedRemote} moved=${result.moved} " +
+            "conflicts=${result.conflicts} settled=${result.settled} skipped=${result.skipped.size} " +
+            "failed=${result.failed.size}",
+    )
+    result.skipped.forEach { Log.w(SYNC_LOG_TAG, "skipped: $it") }
+    result.failed.forEach { Log.w(SYNC_LOG_TAG, "failed: ${it.path}: ${it.message}") }
+}

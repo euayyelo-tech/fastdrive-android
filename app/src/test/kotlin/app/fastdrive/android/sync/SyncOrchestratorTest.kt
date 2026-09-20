@@ -62,8 +62,16 @@ class SyncOrchestratorTest {
         val written = mutableMapOf<String, ByteArrayOutputStream>()
         val trashed = mutableListOf<String>()
         val moved = mutableListOf<Pair<String, String>>()
+        val committed = mutableListOf<String>()
+        val aborted = mutableListOf<String>()
         var trashSucceeds = true
         var moveSucceeds = true
+
+        /** What [statLocal] returns for a given path — settable per test to simulate the REAL
+         *  on-disk (size, mtime) a write left behind, distinct from whatever a remote entry claims.
+         *  Defaults to nothing set, so existing tests that never configure this keep the pre-Finding-#2
+         *  behavior of falling back to the remote entry's own claimed values in SyncOrchestrator. */
+        val localStats = mutableMapOf<String, LocalStat>()
 
         override fun uriFor(path: String): Uri? = files[path]
 
@@ -72,6 +80,16 @@ class SyncOrchestratorTest {
             written[path] = out
             return out
         }
+
+        override fun commitWrite(path: String) {
+            committed.add(path)
+        }
+
+        override fun abortWrite(path: String) {
+            aborted.add(path)
+        }
+
+        override fun statLocal(path: String): LocalStat? = localStats[path]
 
         override fun trash(path: String): Boolean {
             trashed.add(path)
@@ -83,6 +101,8 @@ class SyncOrchestratorTest {
             if (moveSucceeds) files[to] = files.remove(from) ?: Uri.parse("content://fake/$to")
             return moveSucceeds
         }
+
+        override fun pruneTrash(retentionMs: Long): Int = 0
     }
 
     private class FakeFileAccess(private val content: Map<Uri, ByteArray>, private val names: Map<Uri, String> = emptyMap()) : FileAccess {
@@ -496,6 +516,69 @@ class SyncOrchestratorTest {
             "conf.txt" to entry("conf.txt", 8, "remoteeditsha", "2026-02-02T00:00:00Z"),
             conflictName to entry(conflictName, 7, "localeditsha", "2026-02-01T00:00:00Z"),
         )
+
+        val actions2 = plan(base2, local2, remote2, machine)
+        assertTrue("expected an empty second plan, got $actions2", actions2.isEmpty())
+    }
+
+    /**
+     * Finding #2's regression test: a remote entry with `sha256 == null` (e.g. an un-indexed
+     * photo/video the server has never hashed) downloaded for the first time. Android's SAF has
+     * no way to set the downloaded file's on-disk mtime to match the remote's claimed mtime
+     * (unlike desktop's `utimes()` call), so the REAL local mtime after the write lands wherever
+     * the OS put it — simulated here via [FakeLocalFileStore.localStats] returning a value far
+     * from the remote's claimed "2026-01-01" mtime. Before the fix, `sync_base` was written from
+     * the remote entry's claimed mtime, which would never again match what a real re-scan finds
+     * on disk (no sha256 to fall back on for `same()`), so EVERY future pass would see the local
+     * copy as "changed" and re-upload the whole file. After the fix, base is recorded from the
+     * REAL local stat, so a second `plan()` — fed a local snapshot standing in for a real re-scan
+     * finding that same real mtime — has nothing left to do.
+     */
+    @Test
+    fun `a downloaded file with no remote sha256 does not spuriously re-upload on the next pass`() = runBlocking {
+        val machine = "TestPixel"
+        val remote1 = mapOf(
+            "photo.jpg" to entry("photo.jpg", 1000, sha256 = null, mtime = "2026-01-01T00:00:00Z", id = "id-photo", rev = "id-photo:1"),
+        )
+        val actions1 = plan(emptyMap(), emptyMap(), remote1, machine)
+        assertEquals(listOf(Action.Download("photo.jpg", "id-photo")), actions1)
+
+        val localStore = FakeLocalFileStore()
+        localStore.localStats["photo.jpg"] = LocalStat(size = 1000, mtime = "2026-09-20T12:00:00Z")
+        val fileAccess = FakeFileAccess(content = emptyMap())
+
+        val client = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val request = chain.request()
+                val (code, body) = when {
+                    request.url.encodedPath == "/api/files/id-photo/download" ->
+                        200 to """{"url":"https://s3.example.com/get-photo","vault":false}"""
+                    request.url.toString() == "https://s3.example.com/get-photo" -> 200 to "x".repeat(1000)
+                    else -> 500 to """{"error":"unexpected ${request.method} ${request.url}"}"""
+                }
+                jsonResponse(request, code, body)
+            }
+            .build()
+        val api = DriveApi(baseUrl = "https://example.com", client = client)
+
+        val result = SyncOrchestrator.executePlan(
+            actions = actions1, local = emptyMap(), remote = remote1, api = api, httpClient = client,
+            fileAccess = fileAccess, localStore = localStore, baseDao = baseDao, remoteDao = remoteDao,
+        )
+        assertTrue("expected no failures, got ${result.failed}", result.failed.isEmpty())
+        assertEquals(1, result.downloaded)
+        assertEquals(listOf("photo.jpg"), localStore.committed)
+
+        // Base was recorded from the REAL local stat, not the remote's claimed mtime.
+        val base = baseDao.getAll().single { it.path == "photo.jpg" }
+        assertEquals("2026-09-20T12:00:00Z", base.mtime)
+        assertEquals("id-photo:1", base.rev)
+
+        // A real re-scan would find the file at its actual on-disk mtime -- feeding that (plus the
+        // base/remote state this pass left behind) back into plan() must yield nothing further.
+        val base2 = baseDao.getAll().toBaseSnapshot()
+        val remote2 = remoteDao.getAll().toRemoteSnapshot().ifEmpty { remote1 }
+        val local2 = mapOf("photo.jpg" to entry("photo.jpg", 1000, sha256 = null, mtime = "2026-09-20T12:00:00Z"))
 
         val actions2 = plan(base2, local2, remote2, machine)
         assertTrue("expected an empty second plan, got $actions2", actions2.isEmpty())
