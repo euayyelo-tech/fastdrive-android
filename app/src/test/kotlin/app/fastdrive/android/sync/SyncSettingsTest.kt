@@ -1,7 +1,11 @@
 package app.fastdrive.android.sync
 
+import android.app.Application
 import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import androidx.work.testing.WorkManagerTestInitHelper
 import app.fastdrive.android.api.Cursor
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -18,7 +22,8 @@ import org.robolectric.RobolectricTestRunner
  */
 @RunWith(RobolectricTestRunner::class)
 class SyncSettingsTest {
-    private val settings = SyncSettings(ApplicationProvider.getApplicationContext())
+    private val context = ApplicationProvider.getApplicationContext<Application>()
+    private val settings = SyncSettings(context)
 
     @Test
     fun `folder uri defaults to null`() {
@@ -134,5 +139,65 @@ class SyncSettingsTest {
         settings.setPauseCondition(PauseCondition.AnyWifi)
         settings.setPauseCondition(PauseCondition.SpecificWifi(ssid = "NewWifi"))
         assertEquals(PauseCondition.SpecificWifi("NewWifi"), settings.getPauseCondition())
+    }
+
+    // Finding #5 (Phase 4 fix round): a Timer pause whose resumeAtMillis is already in the past
+    // (e.g. the PauseResumeWorker job that should have cleared it was lost) must self-heal instead
+    // of being trusted as still "paused" forever.
+
+    @Test
+    fun `an expired timer pause self-heals to not-paused`() {
+        settings.setPauseCondition(PauseCondition.Timer(resumeAtMillis = System.currentTimeMillis() - 1_000L))
+
+        assertNull(settings.getPauseCondition())
+        assertFalse(settings.isPaused())
+    }
+
+    @Test
+    fun `a timer pause exactly at the resume instant self-heals to not-paused`() {
+        settings.setPauseCondition(PauseCondition.Timer(resumeAtMillis = System.currentTimeMillis()))
+
+        assertNull(settings.getPauseCondition())
+    }
+
+    @Test
+    fun `a still-future timer pause remains paused`() {
+        settings.setPauseCondition(PauseCondition.Timer(resumeAtMillis = System.currentTimeMillis() + 60_000L))
+
+        assertTrue(settings.getPauseCondition() is PauseCondition.Timer)
+        assertTrue(settings.isPaused())
+    }
+
+    // Finding #2 (Phase 4 fix round): clearAccountState() (the shared sign-out path) must not
+    // leave a pause condition set by the previous account for the next one to inherit, and must
+    // cancel any pending PauseResumeWorker timer job too.
+
+    @Test
+    fun `clearAccountState clears a pause condition and cancels a pending resume worker`() {
+        WorkManagerTestInitHelper.initializeTestWorkManager(context)
+        val workManager = WorkManager.getInstance(context)
+        PauseResumeWorker.pauseForDuration(context, settings, durationMillis = 60_000L)
+        assertTrue(settings.isPaused())
+        assertTrue(
+            workManager.getWorkInfosForUniqueWork(PauseResumeWorker.PAUSE_RESUME_WORK_NAME).get()
+                .any { it.state == WorkInfo.State.ENQUEUED },
+        )
+
+        settings.clearAccountState()
+
+        assertNull(settings.getPauseCondition())
+        assertFalse(settings.isPaused())
+        val scheduled = workManager.getWorkInfosForUniqueWork(PauseResumeWorker.PAUSE_RESUME_WORK_NAME).get()
+        assertTrue(scheduled.isEmpty() || scheduled.all { it.state == WorkInfo.State.CANCELLED })
+    }
+
+    @Test
+    fun `clearAccountState clears a manual pause condition too`() {
+        WorkManagerTestInitHelper.initializeTestWorkManager(context)
+        settings.setPauseCondition(PauseCondition.Manual)
+
+        settings.clearAccountState()
+
+        assertNull(settings.getPauseCondition())
     }
 }

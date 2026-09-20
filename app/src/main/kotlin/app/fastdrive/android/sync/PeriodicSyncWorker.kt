@@ -44,7 +44,12 @@ class PeriodicSyncWorker @JvmOverloads constructor(
             // Finding #4: surface what this pass actually did — counts, every skipped path, every
             // failure's own message — rather than silently discarding the SyncResult.
             logSyncResult(result)
-            postSyncNotification(applicationContext, result)
+            // Finding #6 (Phase 4 fix round): a pause can be set in the narrow window between
+            // this pass finishing and the notification being posted — re-check right before
+            // posting rather than trusting the state from before runPass ran.
+            if (!SyncSettings(applicationContext).isPaused()) {
+                postSyncNotification(applicationContext, result)
+            }
             Result.success()
         } catch (e: Exception) {
             if (retryable(statusOf(e))) Result.retry() else Result.failure()

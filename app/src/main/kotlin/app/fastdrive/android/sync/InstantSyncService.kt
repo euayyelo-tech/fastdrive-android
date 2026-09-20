@@ -76,7 +76,12 @@ class InstantSyncService : Service() {
                     val result = runPass(applicationContext)
                     // Finding #4: surface what this pass actually did instead of discarding it.
                     logSyncResult(result)
-                    postSyncNotification(applicationContext, result)
+                    // Finding #6 (Phase 4 fix round): a pause can be set in the narrow window
+                    // between this pass finishing and the notification being posted — re-check
+                    // right before posting rather than trusting the state from before runPass ran.
+                    if (!SyncSettings(applicationContext).isPaused()) {
+                        postSyncNotification(applicationContext, result)
+                    }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -150,6 +155,11 @@ class InstantSyncService : Service() {
                 // INSTANT mode on a cold start — better to log and leave instant sync not running
                 // than crash the whole app on startup.
                 Log.w(SYNC_LOG_TAG, "couldn't start the instant sync foreground service", e)
+                // Finding #4 (Phase 4 fix round): this refusal is also reachable from an
+                // auto-resume (a timer/Wi-Fi pause condition clearing) while the app is
+                // backgrounded — logging alone left sync silently off with no visible signal to
+                // the user, contradicting the UI's own "not paused" status.
+                postCouldNotAutoResumeNotification(context)
             }
         }
 

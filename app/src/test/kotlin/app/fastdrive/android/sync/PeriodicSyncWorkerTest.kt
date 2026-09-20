@@ -1,5 +1,6 @@
 package app.fastdrive.android.sync
 
+import android.app.NotificationManager
 import android.content.Context
 import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
@@ -16,6 +17,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
 
 @RunWith(RobolectricTestRunner::class)
 class PeriodicSyncWorkerTest {
@@ -79,6 +81,37 @@ class PeriodicSyncWorkerTest {
         val result = worker.doWork()
 
         assertTrue(result is ListenableWorker.Result.Retry)
+    }
+
+    // Finding #6 (Phase 4 fix round): a pause can be set in the narrow window between the pass
+    // finishing and the notification being posted — re-checked right before posting rather than
+    // trusting the pause state from before runPass ran.
+
+    @Test
+    fun `does not post a sync notification when paused at the time of posting`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        SyncSettings(context).setPauseCondition(PauseCondition.Manual)
+        val worker = buildWorker { SyncResult(uploaded = 3) }
+
+        val result = worker.doWork()
+
+        assertTrue(result is ListenableWorker.Result.Success)
+        val shadowManager = shadowOf(context.getSystemService(NotificationManager::class.java))
+        // 2001 is SyncNotifier's private SYNC_NOTIFICATION_ID, duplicated here as a literal since
+        // it's file-private and this activity-worthy result would otherwise always post it.
+        assertTrue(shadowManager.activeNotifications.none { it.id == 2001 })
+    }
+
+    @Test
+    fun `posts a sync notification for an active result when not paused`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val worker = buildWorker { SyncResult(uploaded = 3) }
+
+        val result = worker.doWork()
+
+        assertTrue(result is ListenableWorker.Result.Success)
+        val shadowManager = shadowOf(context.getSystemService(NotificationManager::class.java))
+        assertTrue(shadowManager.activeNotifications.any { it.id == 2001 })
     }
 
     @Test

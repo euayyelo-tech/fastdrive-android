@@ -139,6 +139,13 @@ class MainActivity : ComponentActivity() {
                             val signedOut by fileListViewModel.signedOut.collectAsState()
                             LaunchedEffect(signedOut) {
                                 if (signedOut) {
+                                    // Finding #2 (Phase 4 fix round): SyncSettings.clearAccountState()
+                                    // already clears the persisted pause condition on sign-out, but
+                                    // this watcher is an Activity-scoped instance it can't reach —
+                                    // stop it here so a Wi-Fi-based pause condition belonging to the
+                                    // account that just signed out doesn't keep watching (and
+                                    // possibly firing) for the next account that signs in.
+                                    wifiResumeWatcher.stop()
                                     navController.navigate("sign_in") {
                                         popUpTo("files") { inclusive = true }
                                     }
@@ -162,5 +169,15 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    // Finding #3 (Phase 4 fix round): wifiResumeWatcher's ConnectivityManager.NetworkCallback was
+    // never unregistered on Activity destruction — every config change (rotation, theme, font
+    // size, locale) recreates MainActivity, and with it a fresh watcher, while the OLD instance's
+    // callback stayed registered forever (an unconditional leak, and a possible eventual crash if
+    // the platform's per-uid registration cap is ever hit).
+    override fun onDestroy() {
+        wifiResumeWatcher.stop()
+        super.onDestroy()
     }
 }

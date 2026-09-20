@@ -37,6 +37,19 @@ fun matchesTargetNetwork(condition: PauseCondition, connectedSsid: String?): Boo
 }
 
 /**
+ * True when [network] is exactly [alreadyConnectedNetwork] — the network [WifiResumeWatcher.start]
+ * captured as already active right before registering its callback. `Network.equals()` compares by
+ * the platform's own `netId`, which is assigned fresh on every new connection event, so this is
+ * `false` for a genuine reconnection even to the same SSID.
+ *
+ * Pulled out as a pure top-level function (same pattern as [matchesTargetNetwork]) so the fix for
+ * Finding #1 (Phase 4 fix round) — never treating registration's own synchronous "already
+ * satisfies" callback as a new connection — is directly unit-testable.
+ */
+fun isPreExistingConnection(network: Network, alreadyConnectedNetwork: Network?): Boolean =
+    network == alreadyConnectedNetwork
+
+/**
  * Watches for a Wi-Fi connection that satisfies a [PauseCondition.AnyWifi] or
  * [PauseCondition.SpecificWifi] pause, and clears the pause (resuming whichever [SyncSettings]
  * trigger mechanism is selected) the moment it does.
@@ -64,9 +77,20 @@ class WifiResumeWatcher(private val context: Context) {
         stop()
         if (condition !is PauseCondition.AnyWifi && condition !is PauseCondition.SpecificWifi) return
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return
+        // Finding #1 (Phase 4 fix round): registerNetworkCallback() delivers an immediate
+        // onCapabilitiesChanged for any network that ALREADY satisfies the request at registration
+        // time — e.g. the user is already on the target Wi-Fi when they tap "pause until connected
+        // to Wi-Fi". Without this, that synchronous delivery would be indistinguishable from a real
+        // new connection and would clear the pause the instant it was set, silently no-op-ing the
+        // pause the user just asked for. Capturing whichever network was already active right
+        // before registering, and ignoring a callback for that exact same network, tells "already
+        // connected" apart from "just connected" — a genuine reconnection (even to the same SSID)
+        // gets a new [Network] id from the system and so is never mistaken for this one.
+        val alreadyConnectedNetwork = cm.activeNetwork
         val request = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build()
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+                if (isPreExistingConnection(network, alreadyConnectedNetwork)) return
                 if (matchesTargetNetwork(condition, currentSsid(capabilities))) {
                     stop()
                     syncSettings.setPauseCondition(null)
@@ -75,8 +99,11 @@ class WifiResumeWatcher(private val context: Context) {
                 }
             }
         }
-        cm.registerNetworkCallback(request, cb)
-        callback = cb
+        // Finding #3 (Phase 4 fix round): registerNetworkCallback (like unregisterNetworkCallback
+        // in stop() below) can throw if this app has already hit the platform's per-uid callback
+        // registration cap — defensive here for the same reason stop()'s unregister already is.
+        val registered = runCatching { cm.registerNetworkCallback(request, cb) }.isSuccess
+        if (registered) callback = cb
     }
 
     /** Unregisters the callback if one is active. Safe to call when already stopped. */

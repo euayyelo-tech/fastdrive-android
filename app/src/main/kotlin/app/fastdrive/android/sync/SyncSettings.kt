@@ -2,6 +2,7 @@ package app.fastdrive.android.sync
 
 import android.content.Context
 import android.net.Uri
+import androidx.work.WorkManager
 import app.fastdrive.android.api.Cursor
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -43,7 +44,8 @@ sealed class PauseCondition {
  * here vs. `FileListViewModel`'s own `changes_cursor`.
  */
 class SyncSettings(context: Context) {
-    private val prefs = context.applicationContext.getSharedPreferences("fastdrive_sync_prefs", Context.MODE_PRIVATE)
+    private val appContext = context.applicationContext
+    private val prefs = appContext.getSharedPreferences("fastdrive_sync_prefs", Context.MODE_PRIVATE)
     private val json = Json { ignoreUnknownKeys = true }
 
     fun getFolderUri(): Uri? = prefs.getString(KEY_FOLDER_URI, null)?.let { Uri.parse(it) }
@@ -81,7 +83,7 @@ class SyncSettings(context: Context) {
      * one exception, because [Cursor] is already `@Serializable` for the API layer it comes from).
      */
     fun getPauseCondition(): PauseCondition? {
-        return when (prefs.getString(KEY_PAUSE_TYPE, null)) {
+        val condition = when (prefs.getString(KEY_PAUSE_TYPE, null)) {
             PAUSE_TYPE_TIMER -> {
                 val resumeAtMillis = prefs.getLong(KEY_PAUSE_RESUME_AT, -1L)
                 if (resumeAtMillis < 0) null else PauseCondition.Timer(resumeAtMillis)
@@ -94,6 +96,16 @@ class SyncSettings(context: Context) {
             PAUSE_TYPE_MANUAL -> PauseCondition.Manual
             else -> null
         }
+        // Finding #5 (Phase 4 fix round): a Timer whose resumeAtMillis has already passed must
+        // never be trusted as still "paused" — e.g. if the PauseResumeWorker job that was supposed
+        // to clear it was somehow lost (WorkManager DB wiped, an OEM battery killer, etc). Placed
+        // here, the one place every caller (including isPaused()) reads the pause condition
+        // through, so the guard applies everywhere without duplicating it at each call site.
+        if (condition is PauseCondition.Timer && condition.resumeAtMillis <= System.currentTimeMillis()) {
+            setPauseCondition(null)
+            return null
+        }
+        return condition
     }
 
     fun setPauseCondition(condition: PauseCondition?) {
@@ -135,13 +147,27 @@ class SyncSettings(context: Context) {
      * hold a completely different account's files. The alternative (keep the folder, only wipe
      * the sync tables/cursors) would save the next sign-in a folder re-pick, but silently reuses
      * a folder chosen for someone else — not worth the ambiguity.
+     *
+     * Finding #2 (Phase 4 fix round): a pause condition set by the previous account used to
+     * survive sign-out untouched, so a brand-new account signing in on the same device could
+     * inherit a stale "paused until connected to HomeWifi" (or an indefinite manual pause) with no
+     * visible cause. This now clears the three pause keys too and cancels any pending
+     * [PauseResumeWorker] timer job — [WorkManager] is reached directly via [appContext] rather
+     * than adding a `Context` parameter to the shared `handleUnauthorized()` call this is invoked
+     * from, which would also touch [app.fastdrive.android.sync.SyncOrchestrator]'s own call site.
+     * A leftover [WifiResumeWatcher] registration (Activity-scoped, unreachable from here) is torn
+     * down separately at the UI's sign-out observation point.
      */
     fun clearAccountState() {
         prefs.edit()
             .remove(KEY_FOLDER_URI)
             .remove(KEY_REMOTE_CURSOR)
             .remove(KEY_CHANGES_CURSOR_SHARED_WITH_FILE_LIST_VIEW_MODEL)
+            .remove(KEY_PAUSE_TYPE)
+            .remove(KEY_PAUSE_RESUME_AT)
+            .remove(KEY_PAUSE_SSID)
             .apply()
+        WorkManager.getInstance(appContext).cancelUniqueWork(PauseResumeWorker.PAUSE_RESUME_WORK_NAME)
     }
 
     private companion object {

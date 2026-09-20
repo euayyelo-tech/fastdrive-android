@@ -1,6 +1,7 @@
 package app.fastdrive.android.sync
 
 import android.app.Application
+import android.app.NotificationManager
 import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
