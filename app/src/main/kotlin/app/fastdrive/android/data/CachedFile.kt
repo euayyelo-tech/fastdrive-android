@@ -11,4 +11,6 @@ data class CachedFile(
     val size: Long,
     val contentType: String,
     val changedAt: String,
+    val sha256: String? = null,
+    val mtime: String? = null,
 )

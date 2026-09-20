@@ -61,4 +61,42 @@ class CachedFileDaoTest {
         val remaining = dao.observeAll().first()
         assertEquals(listOf(fileB), remaining)
     }
+
+    @Test
+    fun upsertPersistsSha256AndMtime() = runBlocking {
+        val file = CachedFile(
+            id = "c",
+            folder = "/",
+            name = "c.txt",
+            size = 30,
+            contentType = "text/plain",
+            changedAt = "2026-01-01T00:00:00Z",
+            sha256 = "deadbeef",
+            mtime = "2026-01-02T00:00:00Z",
+        )
+
+        dao.upsertAll(listOf(file))
+
+        val stored = dao.observeAll().first().single()
+        assertEquals("deadbeef", stored.sha256)
+        assertEquals("2026-01-02T00:00:00Z", stored.mtime)
+    }
+
+    @Test
+    fun newFilesDefaultSha256AndMtimeToNull() = runBlocking {
+        val file = CachedFile(
+            id = "d",
+            folder = "/",
+            name = "d.txt",
+            size = 40,
+            contentType = "text/plain",
+            changedAt = "2026-01-01T00:00:00Z",
+        )
+
+        dao.upsertAll(listOf(file))
+
+        val stored = dao.observeAll().first().single()
+        assertEquals(null, stored.sha256)
+        assertEquals(null, stored.mtime)
+    }
 }
