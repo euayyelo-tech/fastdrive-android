@@ -24,6 +24,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import app.fastdrive.android.sync.InstantSyncService
 import app.fastdrive.android.sync.PeriodicSyncWorker
 import app.fastdrive.android.sync.SyncMode
 import app.fastdrive.android.sync.SyncSettings
@@ -31,8 +32,9 @@ import app.fastdrive.android.sync.SyncSettings
 /**
  * Lets the user pick the folder FastDrive syncs into and the sync-frequency mode. Choosing a
  * folder or switching to [SyncMode.BATTERY_FRIENDLY] here (re)enqueues Task 7's periodic
- * WorkManager sync via [PeriodicSyncWorker.applySettings]; switching to [SyncMode.INSTANT] cancels
- * it. Task 8's foreground service for INSTANT mode is still out of scope here.
+ * WorkManager sync via [PeriodicSyncWorker.applySettings] and stops Task 8's
+ * [InstantSyncService]; switching to [SyncMode.INSTANT] starts [InstantSyncService] and cancels
+ * the periodic work, so the two modes are always mutually exclusive.
  */
 @Composable
 fun SyncSettingsScreen(syncSettings: SyncSettings) {
@@ -76,7 +78,9 @@ fun SyncSettingsScreen(syncSettings: SyncSettings) {
             onSelect = {
                 syncMode = SyncMode.BATTERY_FRIENDLY
                 syncSettings.setSyncMode(SyncMode.BATTERY_FRIENDLY)
-                // TODO(Task 8): stop the instant-sync foreground service if it's running.
+                // Stop the instant-mode service FIRST so a due periodic tick can't race a still-
+                // running instant loop into two concurrent sync passes.
+                InstantSyncService.applySettings(context, syncSettings)
                 PeriodicSyncWorker.applySettings(context, syncSettings)
             },
         )
@@ -86,8 +90,10 @@ fun SyncSettingsScreen(syncSettings: SyncSettings) {
             onSelect = {
                 syncMode = SyncMode.INSTANT
                 syncSettings.setSyncMode(SyncMode.INSTANT)
+                // Cancel the periodic work FIRST so a tick that's already due can't race the
+                // service start into two concurrent sync passes.
                 PeriodicSyncWorker.applySettings(context, syncSettings)
-                // TODO(Task 8): start the foreground service that watches for changes instantly.
+                InstantSyncService.applySettings(context, syncSettings)
             },
         )
     }

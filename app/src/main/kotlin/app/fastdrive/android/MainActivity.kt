@@ -22,6 +22,7 @@ import androidx.navigation.compose.rememberNavController
 import app.fastdrive.android.api.DriveApi
 import app.fastdrive.android.auth.TokenStore
 import app.fastdrive.android.data.AppDatabase
+import app.fastdrive.android.sync.InstantSyncService
 import app.fastdrive.android.sync.PeriodicSyncWorker
 import app.fastdrive.android.sync.SyncSettings
 import app.fastdrive.android.ui.FileListScreen
@@ -59,6 +60,9 @@ class MainActivity : ComponentActivity() {
         // screen visit, so a battery-friendly choice from a previous install/session actually
         // takes effect again after a process restart.
         PeriodicSyncWorker.applySettings(applicationContext, syncSettings)
+        // Same startup re-assertion as above, for Task 8's instant-mode foreground service — a
+        // process restart while INSTANT mode was last chosen needs this to actually resume it.
+        InstantSyncService.applySettings(applicationContext, syncSettings)
 
         setContent {
             MaterialTheme {

@@ -44,10 +44,9 @@ class SyncSettings(context: Context) {
 
     fun setSyncMode(mode: SyncMode) {
         prefs.edit().putString(KEY_SYNC_MODE, mode.name).apply()
-        // Task 7 wires the actual WorkManager periodic-work start/stop at the call sites
-        // (SyncSettingsScreen, MainActivity startup) via PeriodicSyncWorker.applySettings —
-        // this class only persists the choice.
-        // TODO(Task 8): start/stop the INSTANT-mode foreground service the same way.
+        // Tasks 7/8 wire the actual WorkManager periodic-work / InstantSyncService start/stop at
+        // the call sites (SyncSettingsScreen, MainActivity startup) via
+        // PeriodicSyncWorker.applySettings — this class only persists the choice.
     }
 
     /** The sync engine's own change-feed cursor (Task 6's orchestration reads/writes this around
