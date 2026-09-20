@@ -9,14 +9,19 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
 import java.io.ByteArrayInputStream
 import java.io.InputStream
 
 /**
  * Exercises [LocalScanner.walk] directly against a hand-built [FakeTreeNode]/[FakeHashDao]/
- * [FakeFileAccess] trio rather than a real `DocumentFile` tree — no Android framework or
- * Robolectric needed, mirroring how [MergeEngineTest] drives the pure engine with plain data.
+ * [FakeFileAccess] trio rather than a real `DocumentFile` tree — no fake `DocumentsProvider`
+ * needed, mirroring how [MergeEngineTest] drives the pure engine with plain data. Still runs
+ * under Robolectric (as [ContentResolverFileAccessTest] and [SyncSettingsTest] do) because
+ * `android.net.Uri.parse` is a framework stub outside it.
  */
+@RunWith(RobolectricTestRunner::class)
 class LocalScannerTest {
 
     /** `content://fake/<path>` — unique per path so the fakes can key off it like a real tree would. */
