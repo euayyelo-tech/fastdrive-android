@@ -58,6 +58,17 @@ object FileUploader {
      *
      * On any failure, best-effort aborts the upload server-side (mirrors the old `UploadWorker`
      * behavior exactly) and rethrows, so callers keep their own retry/error-mapping policy.
+     *
+     * [expectedSize] is the size the caller's own scan expected this file to be (`Entry.size`) —
+     * passed only by `SyncOrchestrator`, which has such an expectation; `UploadWorker`'s plain,
+     * non-sync uploads leave it null and skip this check entirely. When it's given and the file's
+     * CURRENT size (re-stat'd here, right before upload) no longer matches, the file is still being
+     * written to since the scan ran: this returns null rather than uploading half-written bytes
+     * under a now-stale hash, deferring to the next sync pass instead — the same guard the
+     * reference engine's `upload()` applies (`fastdrive-app/desktop/src/engine/sync.ts:203`), which
+     * also checks `mtime` where its stat call exposes one; [FileAccess.stat] doesn't return an
+     * mtime, so size is the drift check available here. This is an expected, benign "file busy"
+     * case, not a failure — callers must not log or report it as one.
      */
     suspend fun upload(
         fileAccess: FileAccess,
@@ -69,7 +80,8 @@ object FileUploader {
         nameOverride: String? = null,
         mtime: String? = null,
         sha256: String? = null,
-    ): UploadUrlResponse {
+        expectedSize: Long? = null,
+    ): UploadUrlResponse? {
         val picked = try {
             fileAccess.stat(uri)
         } catch (e: Exception) {
@@ -78,6 +90,9 @@ object FileUploader {
         if (picked.size < 0) {
             // size unknown — see Task 1's noted edge case
             throw IllegalStateException("Couldn't determine the file's size.")
+        }
+        if (expectedSize != null && picked.size != expectedSize) {
+            return null
         }
 
         val multipart = picked.size >= UploadWorker.MULTIPART_THRESHOLD

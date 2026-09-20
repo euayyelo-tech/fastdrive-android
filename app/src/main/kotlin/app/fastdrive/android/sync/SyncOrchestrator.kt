@@ -71,7 +71,7 @@ object SyncOrchestrator {
         // `.fastdrive-trash/...` paths are correctly hidden from sync by `unsyncable()`, but that's
         // internal bookkeeping, not something the user did wrong — don't surface it as "couldn't
         // be synced".
-        val reportableSkipped = scan.skipped.filterNot { it.startsWith("$TRASH_DIR/") }
+        val reportableSkipped = scan.skipped.filterNot { it == TRASH_DIR || it.startsWith("$TRASH_DIR/") }
 
         return try {
             executePlan(
@@ -139,20 +139,25 @@ object SyncOrchestrator {
                         val result = FileUploader.upload(
                             fileAccess, httpClient, api, uri, folder,
                             replace = action.replaceId, mtime = entry.mtime, sha256 = entry.sha256,
+                            expectedSize = entry.size,
                         )
-                        // Mirror what just went up into sync_remote directly (rather than waiting
-                        // for the next pull) and derive base's rev from that SAME mirrored row, so
-                        // base and remote agree on this file's identity right now — `same()` will
-                        // see them match on the very next pass instead of re-uploading/downloading
-                        // forever (the bug this fixes).
-                        val row = mirror(
-                            remoteDao, result.id, path = action.path, size = entry.size,
-                            sha256 = entry.sha256, mtime = entry.mtime, deleted = false, bumpVersion = true,
-                        )
-                        baseDao.upsert(
-                            BaseEntry(path = action.path, id = result.id, size = entry.size, sha256 = entry.sha256, mtime = entry.mtime, rev = revOf(result.id, row.version)),
-                        )
-                        uploaded++
+                        if (result != null) {
+                            // Mirror what just went up into sync_remote directly (rather than
+                            // waiting for the next pull) and derive base's rev from that SAME
+                            // mirrored row, so base and remote agree on this file's identity right
+                            // now — `same()` will see them match on the very next pass instead of
+                            // re-uploading/downloading forever (the bug this fixes).
+                            val row = mirror(
+                                remoteDao, result.id, path = action.path, size = entry.size,
+                                sha256 = entry.sha256, mtime = entry.mtime, deleted = false, bumpVersion = true,
+                            )
+                            baseDao.upsert(
+                                BaseEntry(path = action.path, id = result.id, size = entry.size, sha256 = entry.sha256, mtime = entry.mtime, rev = revOf(result.id, row.version)),
+                            )
+                            uploaded++
+                        }
+                        // else: the file's still being written (its size drifted since the scan) —
+                        // benign, not a failure; skip silently and let the next pass pick it up.
                     }
 
                     is Action.Download -> {
@@ -176,6 +181,12 @@ object SyncOrchestrator {
                     is Action.DeleteRemote -> {
                         api.deleteFile(action.id)
                         baseDao.deleteByPath(action.path)
+                        // Mirror the deletion into sync_remote directly (reference: sync.ts:164's
+                        // `this.mirror(a.id, { deleted: true })`) so a delayed or failed next pull
+                        // doesn't still show this id as live at this path — without this, the next
+                        // plan() sees base=null/local=null/remote=present and resurrects the file
+                        // with a spurious Download against a now-binned id.
+                        mirror(remoteDao, action.id, deleted = true)
                         deletedRemote++
                     }
 
@@ -235,15 +246,19 @@ object SyncOrchestrator {
                         val (renamedFolder, renamedName) = splitPath(action.renamed)
                         val result = FileUploader.upload(
                             fileAccess, httpClient, api, asideUri, renamedFolder, replace = null, nameOverride = renamedName,
-                            mtime = entry.mtime, sha256 = entry.sha256,
+                            mtime = entry.mtime, sha256 = entry.sha256, expectedSize = entry.size,
                         )
-                        val row = mirror(
-                            remoteDao, result.id, path = action.renamed, size = entry.size,
-                            sha256 = entry.sha256, mtime = entry.mtime, deleted = false, bumpVersion = true,
-                        )
-                        baseDao.upsert(
-                            BaseEntry(path = action.renamed, id = result.id, size = entry.size, sha256 = entry.sha256, mtime = entry.mtime, rev = revOf(result.id, row.version)),
-                        )
+                        if (result != null) {
+                            val row = mirror(
+                                remoteDao, result.id, path = action.renamed, size = entry.size,
+                                sha256 = entry.sha256, mtime = entry.mtime, deleted = false, bumpVersion = true,
+                            )
+                            baseDao.upsert(
+                                BaseEntry(path = action.renamed, id = result.id, size = entry.size, sha256 = entry.sha256, mtime = entry.mtime, rev = revOf(result.id, row.version)),
+                            )
+                        }
+                        // else: the aside copy is still being written — benign, skip; the next
+                        // pass will see it as a plain new local file and upload it then.
                         conflicts++
                     }
 

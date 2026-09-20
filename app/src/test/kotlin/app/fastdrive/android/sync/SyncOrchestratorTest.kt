@@ -211,6 +211,11 @@ class SyncOrchestratorTest {
         assertEquals(1, result.settled)
         assertEquals(listOf("bad/.hidden-file"), result.skipped)
 
+        // DeleteRemote: sync_remote is mirrored to deleted=true too (not just sync_base dropped) —
+        // otherwise a delayed/failed next pull would still show this id live at this path and the
+        // next plan() would resurrect it with a spurious Download.
+        assertEquals(true, remoteDao.findById("id-delrem")?.deleted)
+
         // Upload: base picks up the server's real id, entry data from the local snapshot.
         val base = baseDao.getAll().associateBy { it.path }
         assertEquals("id-upload-new", base.getValue("upload.txt").id)
@@ -303,6 +308,90 @@ class SyncOrchestratorTest {
         assertEquals(listOf(".hidden", "a/name:with*bad?chars"), result.skipped)
         assertTrue(result.failed.isEmpty())
         assertTrue(baseDao.getAll().isEmpty())
+    }
+
+    @Test
+    fun `an upload is skipped, not failed, when the file is still being written`() = runBlocking {
+        val client = fakeServer()
+        val api = DriveApi(baseUrl = "https://example.com", client = client)
+        val localStore = FakeLocalFileStore()
+        val uploadUri = Uri.parse("content://fake/upload.txt")
+        localStore.files["upload.txt"] = uploadUri
+        // The scan recorded this file at 11 bytes ("hello world"), but re-stat'ing it right before
+        // upload finds only 5 bytes on disk right now — it's still being written to since the scan
+        // ran. fakeServer() has no route for upload-url/PUT here, so if the guard didn't fire and
+        // the upload proceeded anyway, this would blow up with the interceptor's 500 fallback
+        // instead of quietly skipping.
+        val fileAccess = FakeFileAccess(
+            content = mapOf(uploadUri to "howdy".toByteArray()),
+            names = mapOf(uploadUri to "upload.txt"),
+        )
+        val local = mapOf("upload.txt" to entry("upload.txt", 11, "uploadsha", "2026-01-01T00:00:00Z"))
+
+        val result = SyncOrchestrator.executePlan(
+            actions = listOf(Action.Upload("upload.txt", replaceId = null)),
+            local = local, remote = emptyMap(), api = api, httpClient = client,
+            fileAccess = fileAccess, localStore = localStore, baseDao = baseDao, remoteDao = remoteDao,
+        )
+
+        // Not a failure — a benign, silent defer to the next pass.
+        assertTrue("expected no failures, got ${result.failed}", result.failed.isEmpty())
+        assertEquals(0, result.uploaded)
+        assertTrue("no base row should be written for a skipped upload", baseDao.getAll().isEmpty())
+    }
+
+    @Test
+    fun `a 401 partway through a plan aborts the whole pass instead of recording a failure`() = runBlocking {
+        val localStore = FakeLocalFileStore()
+        val downloadUri = Uri.parse("content://fake/download.txt")
+        val fileAccess = FakeFileAccess(content = emptyMap())
+
+        // download.txt succeeds first (sorted after nothing — Settle/Download/Upload share order
+        // 2, list order is preserved within a tie by sortedBy's stability), then delete-remote.txt
+        // hits a 401. A third action after it (settle.txt) must never run.
+        val client = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val request = chain.request()
+                val (code, respBody) = when {
+                    request.url.encodedPath == "/api/files/id-download/download" ->
+                        200 to """{"url":"https://s3.example.com/get-download","vault":false}"""
+                    request.url.toString() == "https://s3.example.com/get-download" -> 200 to "downloaded-bytes"
+                    request.url.encodedPath == "/api/files/id-delrem" && request.method == "DELETE" ->
+                        401 to """{"error":"unauthorized"}"""
+                    else -> 500 to """{"error":"unexpected ${request.method} ${request.url}"}"""
+                }
+                jsonResponse(request, code, respBody)
+            }
+            .build()
+        val api = DriveApi(baseUrl = "https://example.com", client = client)
+
+        val actions = listOf(
+            Action.Download("download.txt", id = "id-download"),
+            Action.DeleteRemote("delete-remote.txt", id = "id-delrem"),
+            Action.Settle(path = "settle.txt", id = "id-settle"),
+        )
+        val remote = mapOf(
+            "download.txt" to entry("download.txt", 16, "downloadsha", "2026-01-02T00:00:00Z", id = "id-download", rev = "id-download:1"),
+            "settle.txt" to entry("settle.txt", 9, "settlesha", "2026-01-06T00:00:00Z", id = "id-settle", rev = "id-settle:2"),
+        )
+
+        var thrown: Exception? = null
+        try {
+            SyncOrchestrator.executePlan(
+                actions = actions, local = emptyMap(), remote = remote, api = api, httpClient = client,
+                fileAccess = fileAccess, localStore = localStore, baseDao = baseDao, remoteDao = remoteDao,
+            )
+        } catch (e: Exception) {
+            thrown = e
+        }
+
+        assertTrue("expected the 401 to propagate out of executePlan", thrown is app.fastdrive.android.api.ApiException)
+        assertEquals(401, (thrown as app.fastdrive.android.api.ApiException).status)
+        // The action before the 401 completed and was recorded...
+        assertEquals("id-download", baseDao.getAll().singleOrNull { it.path == "download.txt" }?.id)
+        // ...but the one after it never ran — the whole pass stopped dead at the 401, it wasn't
+        // recorded as a per-action failure and carried past.
+        assertTrue(baseDao.getAll().none { it.path == "settle.txt" })
     }
 
     /**
