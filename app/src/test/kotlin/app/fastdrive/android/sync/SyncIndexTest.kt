@@ -54,7 +54,7 @@ class SyncIndexTest {
 
         baseDao.upsertAll(entries)
 
-        val snapshot = baseDao.getAll().toSnapshot()
+        val snapshot = baseDao.getAll().toBaseSnapshot()
         assertEquals(2, snapshot.size)
         assertEquals(Entry(path = "/a.txt", size = 10, sha256 = "aaa", mtime = "2026-01-01T00:00:00Z", id = "id-a", rev = "id-a:1"), snapshot["/a.txt"])
         assertEquals(Entry(path = "/b.txt", size = 20, sha256 = null, mtime = null, id = null, rev = null), snapshot["/b.txt"])
@@ -68,7 +68,7 @@ class SyncIndexTest {
             ),
         )
 
-        val snapshot = remoteDao.getAll().toSnapshot()
+        val snapshot = remoteDao.getAll().toRemoteSnapshot()
 
         assertEquals(1, snapshot.size)
         val entry = snapshot["/docs/report.pdf"]
@@ -86,7 +86,7 @@ class SyncIndexTest {
             ),
         )
 
-        val snapshot = remoteDao.getAll().toSnapshot()
+        val snapshot = remoteDao.getAll().toRemoteSnapshot()
 
         assertEquals(1, snapshot.size)
         assertEquals("/live.txt", snapshot.keys.single())

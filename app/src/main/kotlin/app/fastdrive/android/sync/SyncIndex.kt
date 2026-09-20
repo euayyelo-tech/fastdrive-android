@@ -55,8 +55,14 @@ data class HashEntry(
 /** `sync_remote`'s `rev` is derived, not stored — mirrors desktop's `revOf(id, version)`. */
 fun revOf(id: String, version: Int): String = "$id:$version"
 
-/** Builds the [Snapshot] `plan()` consumes: keyed by path, base's own natural key. */
-fun List<BaseEntry>.toSnapshot(): Snapshot = associate { e ->
+/**
+ * Builds the [Snapshot] `plan()` consumes: keyed by path, base's own natural key.
+ *
+ * Named distinctly from [toRemoteSnapshot] rather than overloaded: both take a `List<T>` receiver,
+ * which erases to the same JVM signature and the Kotlin compiler rejects as a platform
+ * declaration clash.
+ */
+fun List<BaseEntry>.toBaseSnapshot(): Snapshot = associate { e ->
     e.path to Entry(path = e.path, size = e.size, sha256 = e.sha256, mtime = e.mtime, id = e.id, rev = e.rev)
 }
 
@@ -65,7 +71,7 @@ fun List<BaseEntry>.toSnapshot(): Snapshot = associate { e ->
  * as desktop's `remoteSnapshot`), re-keyed from `id` (the table's primary key) to `path` (the
  * key every [Snapshot] uses).
  */
-fun List<RemoteEntry>.toSnapshot(): Snapshot = associate { e ->
+fun List<RemoteEntry>.toRemoteSnapshot(): Snapshot = associate { e ->
     e.path to Entry(path = e.path, size = e.size, sha256 = e.sha256, mtime = e.mtime, id = e.id, rev = revOf(e.id, e.version))
 }
 
