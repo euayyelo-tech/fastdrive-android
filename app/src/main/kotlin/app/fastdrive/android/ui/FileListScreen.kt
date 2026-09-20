@@ -23,6 +23,8 @@ import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -54,7 +56,7 @@ import java.util.UUID
 private data class PendingUpload(val uri: Uri, val folder: String, val workId: UUID)
 
 @Composable
-fun FileListScreen(viewModel: FileListViewModel, baseUrl: String) {
+fun FileListScreen(viewModel: FileListViewModel, baseUrl: String, onSettingsClick: () -> Unit = {}) {
     val files by viewModel.files.collectAsState()
     val refreshError by viewModel.refreshError.collectAsState()
     val context = LocalContext.current
@@ -88,6 +90,16 @@ fun FileListScreen(viewModel: FileListViewModel, baseUrl: String) {
     }
 
     Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("FastDrive") },
+                actions = {
+                    TextButton(onClick = onSettingsClick) {
+                        Text("Settings")
+                    }
+                },
+            )
+        },
         floatingActionButton = {
             FloatingActionButton(onClick = { pickDocumentLauncher.launch(arrayOf("*/*")) }) {
                 Text("+")

@@ -22,9 +22,11 @@ import androidx.navigation.compose.rememberNavController
 import app.fastdrive.android.api.DriveApi
 import app.fastdrive.android.auth.TokenStore
 import app.fastdrive.android.data.AppDatabase
+import app.fastdrive.android.sync.SyncSettings
 import app.fastdrive.android.ui.FileListScreen
 import app.fastdrive.android.ui.FileListViewModel
 import app.fastdrive.android.ui.SignInScreen
+import app.fastdrive.android.ui.SyncSettingsScreen
 
 class MainActivity : ComponentActivity() {
     // Android 13+ requires an explicit runtime prompt for notification permissions; the manifest
@@ -50,6 +52,7 @@ class MainActivity : ComponentActivity() {
         // TokenStore.clear() are all picked up automatically.
         val api = DriveApi(baseUrl = BuildConfig.API_BASE_URL, tokenProvider = { tokenStore.getToken() })
         val database = AppDatabase.get(applicationContext)
+        val syncSettings = SyncSettings(applicationContext)
 
         setContent {
             MaterialTheme {
@@ -81,7 +84,14 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                             }
-                            FileListScreen(viewModel = fileListViewModel, baseUrl = BuildConfig.API_BASE_URL)
+                            FileListScreen(
+                                viewModel = fileListViewModel,
+                                baseUrl = BuildConfig.API_BASE_URL,
+                                onSettingsClick = { navController.navigate("sync_settings") },
+                            )
+                        }
+                        composable("sync_settings") {
+                            SyncSettingsScreen(syncSettings = syncSettings)
                         }
                     }
                 }
