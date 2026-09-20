@@ -87,17 +87,18 @@ class DriveApi(
         name: String, contentType: String, size: Long, folder: String,
         multipart: Boolean, mtime: String? = null, sha256: String? = null, replace: String? = null,
     ): UploadUrlResponse = withContext(Dispatchers.IO) {
-        val body = buildMap {
-            put("name", name); put("contentType", contentType); put("size", size.toString())
-            put("folder", folder); put("multipart", multipart.toString())
-            mtime?.let { put("mtime", it) }; sha256?.let { put("sha256", it) }; replace?.let { put("replace", it) }
-        }
+        // A typed request body, not a Map<String, String> — see UploadUrlRequest's doc comment in
+        // Models.kt for why the old buildMap approach silently broke every multipart upload.
+        val body = UploadUrlRequest(
+            name = name, contentType = contentType, size = size, folder = folder,
+            multipart = multipart, mtime = mtime, sha256 = sha256, replace = replace,
+        )
         call("/api/files/upload-url", "POST", json.encodeToString(body))
     }
 
     suspend fun uploadParts(id: String, uploadId: String, from: Int, to: Int): PartsResponse =
         withContext(Dispatchers.IO) {
-            call("/api/files/$id/parts", "POST", json.encodeToString(mapOf("uploadId" to uploadId, "from" to from.toString(), "to" to to.toString())))
+            call("/api/files/$id/parts", "POST", json.encodeToString(PartsRequest(uploadId, from, to)))
         }
 
     suspend fun uploadComplete(id: String, uploadId: String, parts: List<PartETag>) {

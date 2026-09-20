@@ -7,8 +7,10 @@ import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.Buffer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DriveApiTest {
@@ -109,6 +111,66 @@ class DriveApiTest {
 
         // Must not throw, even though the underlying call fails with a 500.
         api.uploadAbort("f1", "up_1")
+    }
+
+    /**
+     * Locks in the actual serialized request body for uploadUrl()/uploadParts() — previously these
+     * were built via a stringly-typed Map<String, String>, which serialized `multipart: true` as
+     * the JSON STRING "true" rather than the boolean `true`. The server's route does a strict
+     * `body?.multipart === true` check, so that string always failed the comparison and multipart
+     * uploads never actually started server-side. Nothing in this suite asserted on request body
+     * content before — only response parsing and method+URL strings — which is exactly the gap
+     * that let the bug ship.
+     */
+    @Test
+    fun `uploadUrl sends multipart as a JSON boolean and size as a JSON number`() = runBlocking {
+        var body: String? = null
+        val client = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val buffer = Buffer()
+                chain.request().body?.writeTo(buffer)
+                body = buffer.readUtf8()
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body("""{"id":"f1","key":"k","vault":false}""".toResponseBody("application/json".toMediaType()))
+                    .build()
+            }
+            .build()
+        val api = DriveApi(baseUrl = "https://example.com", client = client)
+
+        api.uploadUrl("big.bin", "application/octet-stream", 33554432L, "/", multipart = true)
+        assertTrue(body!!.contains("\"multipart\":true"))
+        assertTrue(body!!.contains("\"size\":33554432"))
+        assertTrue(body!!.contains("\"name\":\"big.bin\""))
+
+        api.uploadUrl("small.txt", "text/plain", 5L, "/", multipart = false)
+        assertTrue(body!!.contains("\"multipart\":false"))
+    }
+
+    @Test
+    fun `uploadParts sends from and to as JSON numbers, not strings`() = runBlocking {
+        var body: String? = null
+        val client = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val buffer = Buffer()
+                chain.request().body?.writeTo(buffer)
+                body = buffer.readUtf8()
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body("""{"urls":{}}""".toResponseBody("application/json".toMediaType()))
+                    .build()
+            }
+            .build()
+        val api = DriveApi(baseUrl = "https://example.com", client = client)
+
+        api.uploadParts("f1", "up_1", 1, 32)
+        assertEquals("""{"uploadId":"up_1","from":1,"to":32}""", body)
     }
 
     /**

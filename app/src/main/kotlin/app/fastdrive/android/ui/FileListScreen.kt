@@ -1,6 +1,7 @@
 package app.fastdrive.android.ui
 
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -33,6 +34,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.work.Constraints
+import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
@@ -42,6 +45,13 @@ import app.fastdrive.android.download.DownloadWorker
 import app.fastdrive.android.upload.ContentResolverFileAccess
 import app.fastdrive.android.upload.UploadWorker
 import java.util.UUID
+
+/**
+ * The upload the app most recently enqueued, kept around (not just its [UUID]) so a failed upload
+ * can be retried by re-enqueueing the same [uri]/[folder] — `WorkRequest.id` alone isn't enough to
+ * retry with, since a fresh `WorkRequest` needs the original inputs again.
+ */
+private data class PendingUpload(val uri: Uri, val folder: String, val workId: UUID)
 
 @Composable
 fun FileListScreen(viewModel: FileListViewModel, baseUrl: String) {
@@ -54,16 +64,22 @@ fun FileListScreen(viewModel: FileListViewModel, baseUrl: String) {
     // does, so a real in-progress download is never lost, just its on-screen indicator.
     val downloadWorkIds = remember { mutableStateMapOf<String, UUID>() }
 
-    // The most recently enqueued upload's WorkRequest id, so its status can be shown above the
-    // list — same observation approach as each download row's own `downloadWorkIds` entry.
-    var uploadWorkId by remember { mutableStateOf<UUID?>(null) }
+    // The most recently enqueued upload, so its status can be shown above the list — same
+    // observation approach as each download row's own `downloadWorkIds` entry.
+    var pendingUpload by remember { mutableStateOf<PendingUpload?>(null) }
 
     val fileAccess = remember { ContentResolverFileAccess(context.contentResolver) }
     val pickDocumentLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri ->
         if (uri != null) {
-            uploadWorkId = enqueueUpload(context, baseUrl, uri)
+            // ACTION_OPEN_DOCUMENT results are persistable, but only once this is called — without
+            // it, a WorkManager retry (a real possibility now that uploads use NetworkType.CONNECTED
+            // constraints and Result.retry()) or a run after the app/device restarts fails with a
+            // SecurityException when ContentResolverFileAccess tries to read the URI again.
+            context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            val folder = "/"
+            pendingUpload = PendingUpload(uri, folder, enqueueUpload(context, baseUrl, uri, folder))
         }
     }
 
@@ -95,7 +111,16 @@ fun FileListScreen(viewModel: FileListViewModel, baseUrl: String) {
                     HorizontalDivider()
                 }
 
-                UploadStatusRow(uploadWorkId)
+                UploadStatusRow(
+                    pendingUpload = pendingUpload,
+                    onRetry = {
+                        pendingUpload?.let { p ->
+                            pendingUpload = p.copy(workId = enqueueUpload(context, baseUrl, p.uri, p.folder))
+                        }
+                    },
+                    onSucceeded = { viewModel.refresh() },
+                    onSignedOut = { viewModel.notifySignedOutFromBackground() },
+                )
 
                 LazyColumn(modifier = Modifier.fillMaxWidth()) {
                     items(files, key = { it.id }) { file ->
@@ -126,40 +151,79 @@ private fun enqueueDownload(context: Context, baseUrl: String, file: CachedFile)
     return request.id
 }
 
-private fun enqueueUpload(context: Context, baseUrl: String, uri: Uri): UUID {
-    // No folder navigation exists in this screen yet, so every upload lands at the root — the
-    // same default `UploadWorker.doWork()` itself falls back to when "folder" is absent.
+private fun enqueueUpload(context: Context, baseUrl: String, uri: Uri, folder: String): UUID {
     val request = OneTimeWorkRequestBuilder<UploadWorker>()
         .setInputData(
             workDataOf(
                 "uri" to uri.toString(),
-                "folder" to "/",
+                "folder" to folder,
                 "base_url" to baseUrl,
             ),
         )
+        // Without this, a retry (WorkManager's own, or the manual "Retry" button below) fires
+        // immediately even with no connectivity, only to fail the same way again.
+        .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
         .build()
     WorkManager.getInstance(context).enqueue(request)
     return request.id
 }
 
 @Composable
-private fun UploadStatusRow(uploadWorkId: UUID?) {
-    if (uploadWorkId == null) return
+private fun UploadStatusRow(
+    pendingUpload: PendingUpload?,
+    onRetry: () -> Unit,
+    onSucceeded: () -> Unit,
+    onSignedOut: () -> Unit,
+) {
+    if (pendingUpload == null) return
     val context = LocalContext.current
-    val state = WorkManager.getInstance(context)
-        .getWorkInfoByIdFlow(uploadWorkId)
+    val workInfo = WorkManager.getInstance(context)
+        .getWorkInfoByIdFlow(pendingUpload.workId)
         .collectAsState(initial = null)
-        .value?.state
+        .value
+    val state = workInfo?.state
+
+    // Reacts to a terminal state exactly once per WorkInfo change: refreshes the list on success
+    // (Task 9 — previously the list only ever refreshed on first composition) and, on a failure
+    // whose outputData carries the auth_error flag UploadWorker sets on a 401, calls the same
+    // sign-out path FileListViewModel already exposes for its own 401 handling.
+    LaunchedEffect(workInfo) {
+        when (state) {
+            WorkInfo.State.SUCCEEDED -> {
+                onSucceeded()
+                // Nice-to-have cleanup: the permission taken for this upload is no longer needed
+                // once it has landed. Only released on success — a FAILED upload may still be
+                // retried with the same uri, which needs the permission to still be held.
+                runCatching {
+                    context.contentResolver.releasePersistableUriPermission(
+                        pendingUpload.uri, Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                    )
+                }
+            }
+            WorkInfo.State.FAILED -> {
+                if (workInfo?.outputData?.getBoolean("auth_error", false) == true) onSignedOut()
+            }
+            else -> {}
+        }
+    }
 
     val label = when (state) {
         WorkInfo.State.ENQUEUED, WorkInfo.State.RUNNING -> "Uploading…"
         WorkInfo.State.SUCCEEDED -> "Uploaded"
-        WorkInfo.State.FAILED -> "Upload failed"
+        // The server's actual rejection message (set by UploadWorker's Result.failure(outputData)),
+        // not a generic string — falls back to one only if outputData somehow has none.
+        WorkInfo.State.FAILED -> workInfo?.outputData?.getString("error") ?: "Upload failed"
         else -> null
     }
     if (label != null) {
-        Row(modifier = Modifier.fillMaxWidth().padding(12.dp)) {
-            Text(label)
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(label, modifier = Modifier.padding(end = 8.dp))
+            if (state == WorkInfo.State.FAILED) {
+                Button(onClick = onRetry) { Text("Retry") }
+            }
         }
         HorizontalDivider()
     }

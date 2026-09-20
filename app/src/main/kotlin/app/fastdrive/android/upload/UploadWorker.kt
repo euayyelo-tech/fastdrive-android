@@ -4,21 +4,32 @@ import android.content.Context
 import android.net.Uri
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
+import androidx.work.workDataOf
+import app.fastdrive.android.api.ApiException
 import app.fastdrive.android.api.DriveApi
 import app.fastdrive.android.api.PartETag
 import app.fastdrive.android.api.UploadUrlResponse
+import app.fastdrive.android.auth.TokenAccess
 import app.fastdrive.android.auth.TokenStore
+import app.fastdrive.android.auth.handleUnauthorized
+import app.fastdrive.android.auth.isUnauthorized
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.IOException
 import java.io.InputStream
+
+/** A raw (non-DriveApi) PUT to a signed storage URL came back with a non-2xx [status]. Carrying
+ *  the status lets the retry loop consult [retryable] the same way an [ApiException] does. */
+private class PutFailedException(val status: Int) : IOException("PUT failed: $status")
 
 /**
  * Uploads a single file picked via [FileAccess] to FastDrive.
@@ -29,7 +40,12 @@ import java.io.InputStream
  *
  * [tokenProvider] mirrors `DownloadWorker`'s reasoning: WorkManager persists `inputData` to its
  * own unencrypted database, so the auth token is deliberately never passed through it — it is
- * read fresh from `TokenStore` each time [doWork] actually runs.
+ * read fresh from `TokenStore` each time [doWork] actually runs. [tokenStore] is the same
+ * underlying store: on a 401 this worker clears it directly (mirroring
+ * `FileListViewModel.refresh()`'s own 401 handling via the shared `auth.isUnauthorized`/
+ * `handleUnauthorized` helpers) since a background worker has no way to navigate the UI itself —
+ * `FileListScreen` picks that up by checking the failed `WorkInfo`'s `auth_error` output flag and
+ * calling `FileListViewModel.notifySignedOutFromBackground()`.
  *
  * [httpClient] and [apiFactory] are both overridable seams so tests can fake the network (an
  * interceptor-equipped `OkHttpClient`, the same technique `DriveApiTest` already uses) instead of
@@ -39,7 +55,8 @@ class UploadWorker @JvmOverloads constructor(
     context: Context,
     params: WorkerParameters,
     private val fileAccess: FileAccess = ContentResolverFileAccess(context.contentResolver),
-    private val tokenProvider: () -> String? = { TokenStore(context.applicationContext).getToken() },
+    private val tokenStore: TokenAccess = TokenStore(context.applicationContext),
+    private val tokenProvider: () -> String? = { tokenStore.getToken() },
     private val httpClient: OkHttpClient = OkHttpClient(),
     private val apiFactory: (baseUrl: String, token: String?, client: OkHttpClient) -> DriveApi =
         { baseUrl, token, client -> DriveApi(baseUrl, tokenProvider = { token }, client = client) },
@@ -54,9 +71,12 @@ class UploadWorker @JvmOverloads constructor(
         val picked = try {
             fileAccess.stat(uri)
         } catch (e: Exception) {
-            return Result.failure()
+            return Result.failure(workDataOf("error" to (e.message ?: "Couldn't read the selected file.")))
         }
-        if (picked.size < 0) return Result.failure() // size unknown — see Task 1's noted edge case
+        if (picked.size < 0) {
+            // size unknown — see Task 1's noted edge case
+            return Result.failure(workDataOf("error" to "Couldn't determine the file's size."))
+        }
 
         val api = apiFactory(baseUrl, tokenProvider(), httpClient)
 
@@ -66,7 +86,7 @@ class UploadWorker @JvmOverloads constructor(
             val multipart = picked.size >= MULTIPART_THRESHOLD
             api.uploadUrl(picked.name, picked.contentType, picked.size, folder, multipart)
         } catch (e: Exception) {
-            return Result.failure()
+            return failureFor(e)
         }
 
         return try {
@@ -82,17 +102,45 @@ class UploadWorker @JvmOverloads constructor(
             // multipart path (a failed single PUT has nothing to abort server-side beyond not
             // calling confirm), but calling it whenever an uploadId exists is harmless.
             start.uploadId?.let { uploadId -> api.uploadAbort(start.id, uploadId) }
-            Result.failure()
+            failureFor(e)
         }
     }
 
-    private fun uploadSingle(picked: PickedFile, start: UploadUrlResponse) {
-        val bytes = fileAccess.openStream(picked.uri).use { it.readBytes() }
-        val mediaType = picked.contentType.toMediaType()
-        val requestBuilder = Request.Builder().url(start.url!!).put(bytes.toRequestBody(mediaType))
-        start.headers?.forEach { (k, v) -> requestBuilder.addHeader(k, v) }
-        httpClient.newCall(requestBuilder.build()).execute().use { response ->
-            if (!response.isSuccessful) throw IllegalStateException("upload PUT failed: ${response.code}")
+    /**
+     * Turns a caught exception into the right terminal [Result]: a 401 clears the shared token
+     * store and flags `auth_error` so the UI signs out; a retryable network/5xx/408/429 failure
+     * becomes `Result.retry()` so WorkManager's own backoff schedules another attempt; anything
+     * else is a permanent failure whose message is surfaced verbatim (never paraphrased) via
+     * `outputData` so the UI can show the server's actual rejection reason.
+     */
+    private fun failureFor(e: Exception): Result {
+        if (isUnauthorized(e)) {
+            handleUnauthorized(tokenStore)
+            return Result.failure(workDataOf("error" to "You've been signed out.", "auth_error" to true))
+        }
+        if (retryable(statusOf(e))) {
+            return Result.retry()
+        }
+        val message = e.message ?: "Upload failed."
+        return Result.failure(workDataOf("error" to message))
+    }
+
+    private fun statusOf(e: Exception): Int = when (e) {
+        is ApiException -> e.status
+        is PutFailedException -> e.status
+        is IOException -> 0
+        else -> -1
+    }
+
+    private suspend fun uploadSingle(picked: PickedFile, start: UploadUrlResponse) {
+        retrying { attempt ->
+            val bytes = fileAccess.openStream(picked.uri).use { it.readBytes() }
+            val mediaType = picked.contentType.toMediaType()
+            val requestBuilder = Request.Builder().url(start.url!!).put(bytes.toRequestBody(mediaType))
+            start.headers?.forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+            httpClient.newCall(requestBuilder.build()).execute().use { response ->
+                if (!response.isSuccessful) throw PutFailedException(response.code)
+            }
         }
     }
 
@@ -134,32 +182,52 @@ class UploadWorker @JvmOverloads constructor(
     }
 
     /**
-     * Uploads a single byte range, retrying up to [MAX_TRIES] times. `content://` streams don't
-     * reliably support random seeking, so each attempt re-opens a fresh stream from the start and
-     * skips forward to [offset] rather than trying to seek an already-open one.
+     * Uploads a single byte range, retrying via [retrying]. `content://` streams don't reliably
+     * support random seeking, so each attempt re-opens a fresh stream from the start and skips
+     * forward to [offset] rather than trying to seek an already-open one.
      */
-    private fun uploadPartWithRetry(
+    private suspend fun uploadPartWithRetry(
         url: String, picked: PickedFile, offset: Long, length: Long, headers: Map<String, String>?,
     ): String {
-        var lastError: Exception? = null
-        repeat(MAX_TRIES) {
-            try {
-                val bytes = fileAccess.openStream(picked.uri).use { stream ->
-                    skipFully(stream, offset)
-                    readExactly(stream, length.toInt())
-                }
-                val requestBuilder = Request.Builder().url(url).put(bytes.toRequestBody())
-                headers?.forEach { (k, v) -> requestBuilder.addHeader(k, v) }
-                httpClient.newCall(requestBuilder.build()).execute().use { response ->
-                    if (!response.isSuccessful) throw IllegalStateException("part PUT failed: ${response.code}")
-                    return response.header("ETag")?.trim('"')
-                        ?: throw IllegalStateException("no ETag returned for part PUT")
-                }
-            } catch (e: Exception) {
-                lastError = e
+        var result: String? = null
+        retrying { attempt ->
+            val bytes = fileAccess.openStream(picked.uri).use { stream ->
+                skipFully(stream, offset)
+                readExactly(stream, length.toInt())
+            }
+            val requestBuilder = Request.Builder().url(url).put(bytes.toRequestBody())
+            headers?.forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+            httpClient.newCall(requestBuilder.build()).execute().use { response ->
+                if (!response.isSuccessful) throw PutFailedException(response.code)
+                result = response.header("ETag")?.trim('"')
+                    ?: throw IllegalStateException("no ETag returned for part PUT")
             }
         }
-        throw lastError ?: IllegalStateException("part upload failed after $MAX_TRIES attempts")
+        return result ?: throw IllegalStateException("part upload produced no ETag")
+    }
+
+    /**
+     * Runs [attemptBlock] up to [MAX_TRIES] times, exactly like `upload-rules.ts`'s
+     * "`MAX_TRIES` per part or per small file" rule. Between attempts it checks [retryable] against
+     * the failure's HTTP status (via [statusOf]) — a permanent failure (e.g. a 403) is rethrown
+     * immediately instead of being retried 4 times in milliseconds — and otherwise waits
+     * [retryDelayMs] (the real exponential-backoff-with-jitter curve ported from upload-rules.ts)
+     * before trying again.
+     */
+    private suspend fun retrying(attemptBlock: suspend (attempt: Int) -> Unit) {
+        var lastError: Exception? = null
+        for (attempt in 1..MAX_TRIES) {
+            try {
+                attemptBlock(attempt)
+                return
+            } catch (e: Exception) {
+                lastError = e
+                val status = statusOf(e)
+                if (!retryable(status) || attempt == MAX_TRIES) throw e
+                delay(retryDelayMs(attempt))
+            }
+        }
+        throw lastError ?: IllegalStateException("upload failed after $MAX_TRIES attempts")
     }
 
     // InputStream.readNBytes(int) would be the obvious one-liner here, but it's API 33+ and this

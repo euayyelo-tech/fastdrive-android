@@ -108,3 +108,30 @@ data class PartETag(val PartNumber: Int, val ETag: String)
 // upload calls' bodies — kotlinx.serialization has no serializer for `Any`.
 @Serializable
 data class CompleteRequest(val uploadId: String, val parts: List<PartETag>)
+
+// Request body for POST /api/files/upload-url. Previously built via a stringly-typed
+// buildMap<String, String> (put("multipart", multipart.toString())), which serialized
+// `multipart: true` as the JSON STRING "true" rather than the boolean `true`. The
+// server route (app/api/files/upload-url/route.ts) does `body?.multipart === true` —
+// a strict equality check that always fails against a string, so multipart uploads
+// never actually started server-side. A real @Serializable class makes every field's
+// wire type explicit and correct.
+@Serializable
+data class UploadUrlRequest(
+    val name: String,
+    val contentType: String,
+    val size: Long,
+    val folder: String,
+    val multipart: Boolean,
+    val mtime: String? = null,
+    val sha256: String? = null,
+    val replace: String? = null,
+)
+
+// Request body for POST /api/files/[id]/parts. Same stringly-typed-map bug as
+// UploadUrlRequest above: `from`/`to` were being sent as JSON strings via
+// mapOf(... to from.toString() ...). The server's Number(body?.from)-style coercion
+// happens to tolerate numeric strings, but there's no reason to rely on that when a
+// typed request body sends real JSON numbers instead.
+@Serializable
+data class PartsRequest(val uploadId: String, val from: Int, val to: Int)

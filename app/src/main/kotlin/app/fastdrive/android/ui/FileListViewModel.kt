@@ -4,12 +4,13 @@ import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
-import app.fastdrive.android.api.ApiException
 import app.fastdrive.android.api.ChangesPage
 import app.fastdrive.android.api.Cursor
 import app.fastdrive.android.api.DriveApi
 import app.fastdrive.android.auth.TokenAccess
 import app.fastdrive.android.auth.TokenStore
+import app.fastdrive.android.auth.handleUnauthorized
+import app.fastdrive.android.auth.isUnauthorized
 import app.fastdrive.android.data.AppDatabase
 import app.fastdrive.android.data.CachedFile
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -76,6 +77,8 @@ class FileListViewModel(
                                     size = remote.size,
                                     contentType = remote.contentType,
                                     changedAt = remote.changedAt,
+                                    sha256 = remote.sha256,
+                                    mtime = remote.mtime,
                                 )
                             },
                         )
@@ -92,14 +95,24 @@ class FileListViewModel(
             }.onSuccess {
                 _refreshError.value = null
             }.onFailure { e ->
-                if (e is ApiException && e.status == 401) {
-                    tokenStore.clear()
+                if (isUnauthorized(e)) {
+                    handleUnauthorized(tokenStore)
                     _signedOut.value = true
                 } else {
                     _refreshError.value = e.message ?: "Couldn't refresh files."
                 }
             }
         }
+    }
+
+    /**
+     * Called by `FileListScreen` when it observes an upload's `WorkInfo` failing with the
+     * `auth_error` flag set. `UploadWorker` already cleared the shared token store itself (it runs
+     * in the background and can't navigate); this just flips the same [signedOut] flag the UI
+     * already watches to navigate back to sign-in, without a second `TokenStore.clear()` call.
+     */
+    fun notifySignedOutFromBackground() {
+        _signedOut.value = true
     }
 
     class Factory(
