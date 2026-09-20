@@ -61,6 +61,9 @@ class LocalScannerTest {
         override suspend fun deleteByPath(path: String) {
             store.remove(path)
         }
+        override suspend fun deleteAll() {
+            store.clear()
+        }
         override suspend fun findHash(path: String, size: Long, mtimeMs: Long): HashEntry? {
             val hit = store[path] ?: return null
             return if (hit.size == size && hit.mtimeMs == mtimeMs) hit else null

@@ -160,7 +160,7 @@ class SyncOrchestratorTest {
         }
         .build()
 
-    private fun entry(path: String, size: Long, sha256: String, mtime: String, id: String? = null, rev: String? = null) =
+    private fun entry(path: String, size: Long, sha256: String?, mtime: String, id: String? = null, rev: String? = null) =
         Entry(path = path, size = size, sha256 = sha256, mtime = mtime, id = id, rev = rev)
 
     @Test
