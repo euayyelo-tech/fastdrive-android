@@ -72,6 +72,12 @@ class PeriodicSyncWorker @JvmOverloads constructor(
          */
         fun applySettings(context: Context, syncSettings: SyncSettings) {
             val workManager = WorkManager.getInstance(context)
+            // Phase 4 Task 3: a pause overrides the selected sync mode entirely, same as if no
+            // folder were set — checked first, ahead of the mode/folder decision below.
+            if (syncSettings.isPaused()) {
+                workManager.cancelUniqueWork(WORK_NAME)
+                return
+            }
             val shouldRun = syncSettings.getSyncMode() == SyncMode.BATTERY_FRIENDLY &&
                 syncSettings.getFolderUri() != null
             if (shouldRun) {

@@ -167,6 +167,12 @@ class InstantSyncService : Service() {
          * [PeriodicSyncWorker.applySettings], never left running alongside the other.
          */
         fun applySettings(context: Context, syncSettings: SyncSettings) {
+            // Phase 4 Task 3: a pause overrides the selected sync mode entirely, same as if no
+            // folder were set — checked first, ahead of the mode/folder decision below.
+            if (syncSettings.isPaused()) {
+                stop(context)
+                return
+            }
             val shouldRun = syncSettings.getSyncMode() == SyncMode.INSTANT &&
                 syncSettings.getFolderUri() != null
             if (shouldRun) start(context) else stop(context)

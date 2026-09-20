@@ -17,6 +17,21 @@ enum class SyncMode {
 }
 
 /**
+ * Why sync is currently paused (Phase 4 Task 3). `null` from [SyncSettings.getPauseCondition]
+ * means "not paused" — there is no separate "paused" boolean, this sealed class's presence/absence
+ * IS the pause state. [SyncSettings.isPaused] is just `getPauseCondition() != null`.
+ *
+ * [Timer] and [SpecificWifi] carry the data needed to auto-resume (Task 3's [PauseResumeWorker] for
+ * the former, Tasks 4-5's Wi-Fi watcher for the latter); [AnyWifi] and [Manual] carry none.
+ */
+sealed class PauseCondition {
+    data class Timer(val resumeAtMillis: Long) : PauseCondition()
+    object AnyWifi : PauseCondition()
+    data class SpecificWifi(val ssid: String) : PauseCondition()
+    object Manual : PauseCondition()
+}
+
+/**
  * Plain (unencrypted) `SharedPreferences`-backed storage for sync settings: the synced folder's
  * tree [Uri], the chosen [SyncMode], and the sync engine's own change-feed [Cursor].
  *
@@ -60,6 +75,52 @@ class SyncSettings(context: Context) {
     }
 
     /**
+     * `null` = not paused. Backed by a type-tag string plus the one field ([KEY_PAUSE_RESUME_AT]
+     * or [KEY_PAUSE_SSID]) that condition needs, matching this class's existing plain-value
+     * storage convention (no JSON library for a value this simple — [getRemoteCursor] above is the
+     * one exception, because [Cursor] is already `@Serializable` for the API layer it comes from).
+     */
+    fun getPauseCondition(): PauseCondition? {
+        return when (prefs.getString(KEY_PAUSE_TYPE, null)) {
+            PAUSE_TYPE_TIMER -> {
+                val resumeAtMillis = prefs.getLong(KEY_PAUSE_RESUME_AT, -1L)
+                if (resumeAtMillis < 0) null else PauseCondition.Timer(resumeAtMillis)
+            }
+            PAUSE_TYPE_ANY_WIFI -> PauseCondition.AnyWifi
+            PAUSE_TYPE_SPECIFIC_WIFI -> {
+                val ssid = prefs.getString(KEY_PAUSE_SSID, null)
+                if (ssid == null) null else PauseCondition.SpecificWifi(ssid)
+            }
+            PAUSE_TYPE_MANUAL -> PauseCondition.Manual
+            else -> null
+        }
+    }
+
+    fun setPauseCondition(condition: PauseCondition?) {
+        val editor = prefs.edit()
+        when (condition) {
+            null -> editor.remove(KEY_PAUSE_TYPE).remove(KEY_PAUSE_RESUME_AT).remove(KEY_PAUSE_SSID)
+            is PauseCondition.Timer -> editor.putString(KEY_PAUSE_TYPE, PAUSE_TYPE_TIMER)
+                .putLong(KEY_PAUSE_RESUME_AT, condition.resumeAtMillis)
+                .remove(KEY_PAUSE_SSID)
+            is PauseCondition.AnyWifi -> editor.putString(KEY_PAUSE_TYPE, PAUSE_TYPE_ANY_WIFI)
+                .remove(KEY_PAUSE_RESUME_AT)
+                .remove(KEY_PAUSE_SSID)
+            is PauseCondition.SpecificWifi -> editor.putString(KEY_PAUSE_TYPE, PAUSE_TYPE_SPECIFIC_WIFI)
+                .putString(KEY_PAUSE_SSID, condition.ssid)
+                .remove(KEY_PAUSE_RESUME_AT)
+            is PauseCondition.Manual -> editor.putString(KEY_PAUSE_TYPE, PAUSE_TYPE_MANUAL)
+                .remove(KEY_PAUSE_RESUME_AT)
+                .remove(KEY_PAUSE_SSID)
+        }
+        editor.apply()
+    }
+
+    /** [PeriodicSyncWorker.applySettings] and [InstantSyncService.applySettings] both gate on this
+     *  first, regardless of [getSyncMode] — see their own doc comments. */
+    fun isPaused(): Boolean = getPauseCondition() != null
+
+    /**
      * Called from the shared sign-out path ([app.fastdrive.android.auth.handleUnauthorized]) to
      * wipe everything here that was configured in the context of the account that just signed
      * out: the folder pick, this engine's own remote cursor, and Phase 1's separate
@@ -87,6 +148,14 @@ class SyncSettings(context: Context) {
         const val KEY_FOLDER_URI = "sync_folder_uri"
         const val KEY_SYNC_MODE = "sync_mode"
         const val KEY_REMOTE_CURSOR = "sync_remote_cursor"
+        const val KEY_PAUSE_TYPE = "sync_pause_type"
+        const val KEY_PAUSE_RESUME_AT = "sync_pause_resume_at"
+        const val KEY_PAUSE_SSID = "sync_pause_ssid"
+
+        const val PAUSE_TYPE_TIMER = "TIMER"
+        const val PAUSE_TYPE_ANY_WIFI = "ANY_WIFI"
+        const val PAUSE_TYPE_SPECIFIC_WIFI = "SPECIFIC_WIFI"
+        const val PAUSE_TYPE_MANUAL = "MANUAL"
 
         /** `FileListViewModel`'s own private `CURSOR_KEY` constant, duplicated here (not
          *  imported — it's `private` and lives in the `ui` package) because both classes agree by

@@ -4,7 +4,9 @@ import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import app.fastdrive.android.api.Cursor
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -68,5 +70,69 @@ class SyncSettingsTest {
         assertEquals(uri, settings.getFolderUri())
         assertEquals(SyncMode.INSTANT, settings.getSyncMode())
         assertEquals(cursor, settings.getRemoteCursor())
+    }
+
+    @Test
+    fun `pause condition defaults to null and not paused`() {
+        assertNull(settings.getPauseCondition())
+        assertFalse(settings.isPaused())
+    }
+
+    @Test
+    fun `timer pause condition round-trips through storage`() {
+        settings.setPauseCondition(PauseCondition.Timer(resumeAtMillis = 123456789L))
+
+        assertEquals(PauseCondition.Timer(123456789L), settings.getPauseCondition())
+        assertTrue(settings.isPaused())
+    }
+
+    @Test
+    fun `any-wifi pause condition round-trips through storage`() {
+        settings.setPauseCondition(PauseCondition.AnyWifi)
+
+        assertEquals(PauseCondition.AnyWifi, settings.getPauseCondition())
+        assertTrue(settings.isPaused())
+    }
+
+    @Test
+    fun `specific-wifi pause condition round-trips through storage`() {
+        settings.setPauseCondition(PauseCondition.SpecificWifi(ssid = "HomeWifi"))
+
+        assertEquals(PauseCondition.SpecificWifi("HomeWifi"), settings.getPauseCondition())
+        assertTrue(settings.isPaused())
+    }
+
+    @Test
+    fun `manual pause condition round-trips through storage`() {
+        settings.setPauseCondition(PauseCondition.Manual)
+
+        assertEquals(PauseCondition.Manual, settings.getPauseCondition())
+        assertTrue(settings.isPaused())
+    }
+
+    @Test
+    fun `clearing the pause condition un-pauses`() {
+        settings.setPauseCondition(PauseCondition.Manual)
+        assertTrue(settings.isPaused())
+
+        settings.setPauseCondition(null)
+
+        assertNull(settings.getPauseCondition())
+        assertFalse(settings.isPaused())
+    }
+
+    @Test
+    fun `switching pause condition types does not leak the previous type's fields`() {
+        settings.setPauseCondition(PauseCondition.SpecificWifi(ssid = "HomeWifi"))
+        settings.setPauseCondition(PauseCondition.Timer(resumeAtMillis = 999L))
+
+        // If the old SSID key survived, getPauseCondition would still be internally consistent
+        // (it only reads the fields for the current type tag), but round-tripping back to
+        // SpecificWifi should not resurrect the old ssid value either.
+        assertEquals(PauseCondition.Timer(999L), settings.getPauseCondition())
+
+        settings.setPauseCondition(PauseCondition.AnyWifi)
+        settings.setPauseCondition(PauseCondition.SpecificWifi(ssid = "NewWifi"))
+        assertEquals(PauseCondition.SpecificWifi("NewWifi"), settings.getPauseCondition())
     }
 }
