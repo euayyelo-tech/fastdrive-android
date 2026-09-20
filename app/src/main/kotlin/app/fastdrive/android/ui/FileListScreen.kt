@@ -19,6 +19,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -55,6 +56,7 @@ import java.util.UUID
  */
 private data class PendingUpload(val uri: Uri, val folder: String, val workId: UUID)
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FileListScreen(viewModel: FileListViewModel, baseUrl: String, onSettingsClick: () -> Unit = {}) {
     val files by viewModel.files.collectAsState()
