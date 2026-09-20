@@ -77,7 +77,7 @@ class LocalScannerTest {
     }
 
     // sha256("hello world") — computed independently of LocalScanner to check its output.
-    private val helloWorldSha = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde"
+    private val helloWorldSha = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
 
     @Test
     fun `unchanged file reuses the cached hash without re-reading bytes`() = runBlocking {
