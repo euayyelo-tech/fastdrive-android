@@ -113,6 +113,13 @@ fun SyncSettingsScreen(
         // process has actually seen — so the network the user is already on cannot instantly
         // satisfy the pause they are setting right now, and nothing about that depends on this
         // being the call site that sets pauses.
+        //
+        // Round 4: this start() is also what takes the pause's FIRST census — everything connected
+        // right now is recorded as "was already here". A later start() for the same pause (reopening
+        // the app) is a re-arm, and anything connected then that this census didn't see must have
+        // arrived while nothing was watching, so it resolves the pause. See
+        // WifiResumeWatcher.censusStampForUnseenNetwork; the distinction comes from process state,
+        // not from this call site.
         wifiResumeWatcher.start(syncSettings, condition)
         pauseCondition = condition
         wifiPermissionDenied = false

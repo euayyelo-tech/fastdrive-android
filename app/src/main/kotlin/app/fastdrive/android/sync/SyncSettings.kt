@@ -2,6 +2,7 @@ package app.fastdrive.android.sync
 
 import android.content.Context
 import android.net.Uri
+import android.os.SystemClock
 import androidx.work.WorkManager
 import app.fastdrive.android.api.Cursor
 import kotlinx.serialization.encodeToString
@@ -132,27 +133,58 @@ class SyncSettings(context: Context) {
     }
 
     /**
-     * Wall-clock time the currently-stored pause condition was set, or [PAUSE_SET_AT_UNKNOWN] when
+     * WALL-CLOCK time the currently-stored pause condition was set, or [PAUSE_SET_AT_UNKNOWN] when
      * nothing is paused (or when the pause was stored by a build predating this key).
      *
-     * This exists so [WifiResumeWatcher] can answer "did this network arrive AFTER the user set
-     * this pause?" from real persisted state instead of from a flag each call site has to pass
-     * correctly — see [shouldResolvePause]. [PAUSE_SET_AT_UNKNOWN] is [Long.MIN_VALUE], i.e. "older
-     * than anything", so a pause left over from an older install behaves exactly like a pause that
-     * predates this process: an already-connected matching network resolves it.
+     * Display and diagnostics ONLY — never compare this against anything. `System.currentTimeMillis()`
+     * can jump backwards or forwards at any moment (NTP correction, user changing the clock, a
+     * timezone-less device catching up after boot), so a difference between two wall-clock stamps is
+     * not a reliable measure of what happened first. Round 4 / Fix B: [WifiResumeWatcher] used to
+     * compare this against a wall-clock-derived process start time, and a forward jump in between
+     * could silently clear a pause. Every ordering decision now uses
+     * [getPauseSetAtElapsedRealtime] instead. This value is kept because it is the only
+     * human-meaningful "paused at 14:32" stamp — an elapsedRealtime value cannot be shown to anyone.
      */
     fun getPauseSetAtMillis(): Long = prefs.getLong(KEY_PAUSE_SET_AT, PAUSE_SET_AT_UNKNOWN)
 
     /**
-     * [nowMillis] is injectable purely so tests can place a pause definitively before or after some
-     * other event; production always uses the real clock.
+     * Milliseconds since boot (`SystemClock.elapsedRealtime()`) at which the currently-stored pause
+     * condition was set, or [PAUSE_SET_AT_UNKNOWN] when nothing is paused (or when the pause was
+     * stored by a build predating this key).
+     *
+     * This is the stamp every ordering decision uses. It exists so [WifiResumeWatcher] can answer
+     * "did this network arrive AFTER the user set this pause?" from real persisted state instead of
+     * from a flag each call site has to pass correctly — see [shouldResolvePause] — and it is in the
+     * monotonic `elapsedRealtime` domain so no clock change can flip that answer.
+     *
+     * [PAUSE_SET_AT_UNKNOWN] is [Long.MIN_VALUE], i.e. "older than anything", so a pause left over
+     * from an older install behaves exactly like a pause that predates this process: an
+     * already-connected matching network resolves it. A stamp from BEFORE a reboot reads as being in
+     * the future (elapsedRealtime restarts at zero on boot), which [shouldResolvePause] recognises
+     * and treats the same way.
+     */
+    fun getPauseSetAtElapsedRealtime(): Long = prefs.getLong(KEY_PAUSE_SET_AT_ELAPSED, PAUSE_SET_AT_UNKNOWN)
+
+    /**
+     * [nowMillis] (wall clock, for display) and [nowElapsedRealtime] (since boot, for ordering) are
+     * injectable purely so tests can place a pause definitively before or after some other event;
+     * production always uses the real clocks. They are two separate values on purpose and must never
+     * be conflated — see [getPauseSetAtMillis] and [getPauseSetAtElapsedRealtime].
      */
     @JvmOverloads
-    fun setPauseCondition(condition: PauseCondition?, nowMillis: Long = System.currentTimeMillis()) {
+    fun setPauseCondition(
+        condition: PauseCondition?,
+        nowMillis: Long = System.currentTimeMillis(),
+        nowElapsedRealtime: Long = SystemClock.elapsedRealtime(),
+    ) {
         val editor = prefs.edit()
         // Stamped for every condition type, cleared whenever the pause is (so an unpaused
         // SyncSettings can never hand WifiResumeWatcher a stale "set at" from a previous pause).
-        if (condition == null) editor.remove(KEY_PAUSE_SET_AT) else editor.putLong(KEY_PAUSE_SET_AT, nowMillis)
+        if (condition == null) {
+            editor.remove(KEY_PAUSE_SET_AT).remove(KEY_PAUSE_SET_AT_ELAPSED)
+        } else {
+            editor.putLong(KEY_PAUSE_SET_AT, nowMillis).putLong(KEY_PAUSE_SET_AT_ELAPSED, nowElapsedRealtime)
+        }
         when (condition) {
             null -> editor.remove(KEY_PAUSE_TYPE).remove(KEY_PAUSE_RESUME_AT).remove(KEY_PAUSE_SSID)
             is PauseCondition.Timer -> editor.putString(KEY_PAUSE_TYPE, PAUSE_TYPE_TIMER)
@@ -210,6 +242,7 @@ class SyncSettings(context: Context) {
             .remove(KEY_PAUSE_RESUME_AT)
             .remove(KEY_PAUSE_SSID)
             .remove(KEY_PAUSE_SET_AT)
+            .remove(KEY_PAUSE_SET_AT_ELAPSED)
             .apply()
         WorkManager.getInstance(appContext).cancelUniqueWork(PauseResumeWorker.PAUSE_RESUME_WORK_NAME)
     }
@@ -222,8 +255,13 @@ class SyncSettings(context: Context) {
         const val KEY_PAUSE_RESUME_AT = "sync_pause_resume_at"
         const val KEY_PAUSE_SSID = "sync_pause_ssid"
 
-        /** When the stored pause condition was set — see [getPauseSetAtMillis]. */
+        /** When the stored pause condition was set, in wall-clock terms — display/diagnostics only,
+         *  see [getPauseSetAtMillis]. */
         const val KEY_PAUSE_SET_AT = "sync_pause_set_at"
+
+        /** When the stored pause condition was set, in milliseconds since boot — the stamp every
+         *  ordering decision uses, see [getPauseSetAtElapsedRealtime]. */
+        const val KEY_PAUSE_SET_AT_ELAPSED = "sync_pause_set_at_elapsed"
 
         /** "Older than anything": no pause stored, or a pause written before this key existed. */
         const val PAUSE_SET_AT_UNKNOWN = Long.MIN_VALUE

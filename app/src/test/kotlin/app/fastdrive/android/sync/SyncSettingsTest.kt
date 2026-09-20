@@ -51,12 +51,42 @@ class SyncSettingsTest {
         assertEquals(Long.MIN_VALUE, settings.getPauseSetAtMillis())
     }
 
+    // Round 4 / Fix B: the ordering decision moved to a monotonic elapsedRealtime stamp, kept
+    // strictly separate from the wall-clock one above (which is display/diagnostics only). Both are
+    // stored, and both must vanish with the pause.
+
+    @Test
+    fun `pause set-at elapsed defaults to unknown when nothing is paused`() {
+        assertEquals(Long.MIN_VALUE, settings.getPauseSetAtElapsedRealtime())
+    }
+
+    @Test
+    fun `the wall-clock and elapsed pause stamps are stored separately and never conflated`() {
+        settings.setPauseCondition(
+            PauseCondition.SpecificWifi("HomeWifi"),
+            nowMillis = 1_700_000_000_000L,
+            nowElapsedRealtime = 560_000L,
+        )
+
+        assertEquals(1_700_000_000_000L, settings.getPauseSetAtMillis())
+        assertEquals(560_000L, settings.getPauseSetAtElapsedRealtime())
+
+        settings.setPauseCondition(null)
+        assertEquals(Long.MIN_VALUE, settings.getPauseSetAtMillis())
+        assertEquals(Long.MIN_VALUE, settings.getPauseSetAtElapsedRealtime())
+    }
+
     @Test
     fun `clearAccountState drops the pause set-at along with the pause`() {
         WorkManagerTestInitHelper.initializeTestWorkManager(context)
-        settings.setPauseCondition(PauseCondition.AnyWifi, nowMillis = 1_700_000_000_000L)
+        settings.setPauseCondition(
+            PauseCondition.AnyWifi,
+            nowMillis = 1_700_000_000_000L,
+            nowElapsedRealtime = 560_000L,
+        )
         settings.clearAccountState()
         assertEquals(Long.MIN_VALUE, settings.getPauseSetAtMillis())
+        assertEquals(Long.MIN_VALUE, settings.getPauseSetAtElapsedRealtime())
     }
 
     @Test

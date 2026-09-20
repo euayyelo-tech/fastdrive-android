@@ -119,6 +119,12 @@ class MainActivity : ComponentActivity() {
         // earlier on the network they were already sitting on. The watcher now decides that from
         // SyncSettings' pause timestamp, the real process start time, and what this process has
         // actually watched connect — see WifiResumeWatcher.shouldResolvePause.
+        //
+        // Round 4: this call is also the one that has to notice a network which connected while
+        // nothing was watching (app backgrounded, Activity destroyed, same process still alive).
+        // The watcher tells that apart from "the network we were already on" by whether this
+        // process has already censused this exact pause — see censusStampForUnseenNetwork — so
+        // again nothing depends on which call site this is.
         val pauseCondition = syncSettings.getPauseCondition()
         if (pauseCondition is PauseCondition.AnyWifi || pauseCondition is PauseCondition.SpecificWifi) {
             wifiResumeWatcher.start(syncSettings, pauseCondition)
