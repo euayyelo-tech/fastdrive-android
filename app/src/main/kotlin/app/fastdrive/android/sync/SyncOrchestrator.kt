@@ -57,6 +57,14 @@ object SyncOrchestrator {
         // catch-all safety net around the parts that had none.
         return try {
             runOnePassInner(context)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // Kotlin's CancellationException IS an Exception, so without this specific catch
+            // ahead of the general one below, a real coroutine cancellation (mode switch, the
+            // service stopping the loop, the service being destroyed) would get silently absorbed
+            // into a bogus SyncResult instead of propagating — which in turn defeats
+            // InstantSyncService's own `catch (e: CancellationException) { throw e }` in its poll
+            // loop, since it never even sees the cancellation (this function already swallowed it).
+            throw e
         } catch (e: Exception) {
             Log.w(SYNC_LOG_TAG, "sync pass aborted by an unexpected exception", e)
             SyncResult(failed = listOf(SyncFailure(path = "", message = e.message ?: "Sync was interrupted.")))

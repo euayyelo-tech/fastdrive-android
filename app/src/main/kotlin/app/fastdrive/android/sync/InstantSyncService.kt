@@ -1,6 +1,5 @@
 package app.fastdrive.android.sync
 
-import android.app.ForegroundServiceStartNotAllowedException
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
@@ -131,12 +130,24 @@ class InstantSyncService : Service() {
             val intent = Intent(context, InstantSyncService::class.java)
             try {
                 context.startForegroundService(intent)
-            } catch (e: ForegroundServiceStartNotAllowedException) {
+            } catch (e: Exception) {
                 // Finding #9: API 31+ can refuse a foreground-service start under certain
                 // conditions (e.g. no active foreground exemption while starting from the
-                // background). This is reachable from MainActivity.onCreate() re-asserting a
-                // previously-chosen INSTANT mode on a cold start — better to log and leave instant
-                // sync not running than crash the whole app on startup.
+                // background), via ForegroundServiceStartNotAllowedException. That type only
+                // exists on API 31+, and this app's minSdk is 29 — a `catch
+                // (e: ForegroundServiceStartNotAllowedException)` clause would get its class
+                // reference resolved at class-verification time regardless of the SDK_INT this
+                // actually runs under, risking a NoClassDefFoundError on API 29/30 even though the
+                // exception itself is never thrown there. Catching the always-available Exception
+                // and checking the runtime type by name (rather than referencing the class
+                // literal) sidesteps that verification issue entirely, while still telling this
+                // specific, expected failure apart from anything else that could go wrong here.
+                val isExpectedRefusal = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                    e::class.qualifiedName == "android.app.ForegroundServiceStartNotAllowedException"
+                if (!isExpectedRefusal) throw e
+                // This is reachable from MainActivity.onCreate() re-asserting a previously-chosen
+                // INSTANT mode on a cold start — better to log and leave instant sync not running
+                // than crash the whole app on startup.
                 Log.w(SYNC_LOG_TAG, "couldn't start the instant sync foreground service", e)
             }
         }
