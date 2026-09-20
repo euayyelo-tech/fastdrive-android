@@ -346,9 +346,10 @@ class SyncOrchestratorTest {
         val downloadUri = Uri.parse("content://fake/download.txt")
         val fileAccess = FakeFileAccess(content = emptyMap())
 
-        // download.txt succeeds first (sorted after nothing — Settle/Download/Upload share order
-        // 2, list order is preserved within a tie by sortedBy's stability), then delete-remote.txt
-        // hits a 401. A third action after it (settle.txt) must never run.
+        // download.txt succeeds first (order 2). Deletes are ordered LAST (order 3, actionOrder()),
+        // so both DeleteRemote actions run after it, in their original relative order: the first
+        // hits a 401, and the second — which would otherwise succeed — must never run because the
+        // whole pass stops dead right there.
         val client = OkHttpClient.Builder()
             .addInterceptor { chain ->
                 val request = chain.request()
@@ -356,8 +357,9 @@ class SyncOrchestratorTest {
                     request.url.encodedPath == "/api/files/id-download/download" ->
                         200 to """{"url":"https://s3.example.com/get-download","vault":false}"""
                     request.url.toString() == "https://s3.example.com/get-download" -> 200 to "downloaded-bytes"
-                    request.url.encodedPath == "/api/files/id-delrem" && request.method == "DELETE" ->
+                    request.url.encodedPath == "/api/files/id-delrem-1" && request.method == "DELETE" ->
                         401 to """{"error":"unauthorized"}"""
+                    request.url.encodedPath == "/api/files/id-delrem-2" && request.method == "DELETE" -> 200 to "{}"
                     else -> 500 to """{"error":"unexpected ${request.method} ${request.url}"}"""
                 }
                 jsonResponse(request, code, respBody)
@@ -367,12 +369,11 @@ class SyncOrchestratorTest {
 
         val actions = listOf(
             Action.Download("download.txt", id = "id-download"),
-            Action.DeleteRemote("delete-remote.txt", id = "id-delrem"),
-            Action.Settle(path = "settle.txt", id = "id-settle"),
+            Action.DeleteRemote("delete-remote-1.txt", id = "id-delrem-1"),
+            Action.DeleteRemote("delete-remote-2.txt", id = "id-delrem-2"),
         )
         val remote = mapOf(
             "download.txt" to entry("download.txt", 16, "downloadsha", "2026-01-02T00:00:00Z", id = "id-download", rev = "id-download:1"),
-            "settle.txt" to entry("settle.txt", 9, "settlesha", "2026-01-06T00:00:00Z", id = "id-settle", rev = "id-settle:2"),
         )
 
         var thrown: Exception? = null
@@ -389,9 +390,10 @@ class SyncOrchestratorTest {
         assertEquals(401, (thrown as app.fastdrive.android.api.ApiException).status)
         // The action before the 401 completed and was recorded...
         assertEquals("id-download", baseDao.getAll().singleOrNull { it.path == "download.txt" }?.id)
-        // ...but the one after it never ran — the whole pass stopped dead at the 401, it wasn't
-        // recorded as a per-action failure and carried past.
-        assertTrue(baseDao.getAll().none { it.path == "settle.txt" })
+        // ...but the one after the 401 (in execution order) never ran — the whole pass stopped
+        // dead at the 401 rather than recording it as one failed action and carrying on: its
+        // mirror() call (which only happens after a successful api.deleteFile) never fired.
+        assertNull(remoteDao.findById("id-delrem-2"))
     }
 
     /**
