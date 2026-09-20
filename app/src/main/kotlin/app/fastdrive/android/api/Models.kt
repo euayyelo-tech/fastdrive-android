@@ -66,3 +66,45 @@ data class WhoamiResponse(
     val used: Long,
     val quota: Long,
 )
+
+// Verified against fastdrive-app's real route handlers (app/api/files/upload-url,
+// [id]/parts, [id]/complete, [id]/confirm, [id]/abort/route.ts), not just transcribed
+// from the task brief — two fields the brief's draft omitted:
+//   - `key`: always present in every upload-url response branch (fresh, replace,
+//     multipart, single-PUT); it's the storage object key, distinct from `id`.
+//   - `vault`: always present (true/false), telling the client whether the file
+//     landed in an E2E-encrypted Vault folder.
+// `replaced`/`versionId` only appear on the REPLACE branch, so they stay nullable.
+@Serializable
+data class UploadUrlResponse(
+    val id: String,
+    val key: String,
+    val url: String? = null,
+    val headers: Map<String, String>? = null,
+    val multipart: Boolean = false,
+    val uploadId: String? = null,
+    val partSize: Long? = null,
+    val parts: Int? = null,
+    val vault: Boolean = false,
+    val replaced: Boolean? = null,
+    val versionId: String? = null,
+)
+
+// POST /api/files/[id]/parts returns { urls: { [partNumber]: url } }. JS object keys
+// are always strings on the wire even though the server builds the map from numbers,
+// so Map<String, String> is the correct wire shape here (confirmed by reading
+// [id]/parts/route.ts directly rather than trusting the brief's transcription).
+@Serializable
+data class PartsResponse(val urls: Map<String, String>)
+
+// POST /api/files/[id]/complete body: { uploadId, parts: [{ PartNumber, ETag }] }.
+// Field casing (PartNumber, ETag — not partNumber/etag) confirmed against
+// [id]/complete/route.ts's own destructuring.
+@Serializable
+data class PartETag(val PartNumber: Int, val ETag: String)
+
+// Request body for POST /api/files/[id]/complete. A plain mapOf(String to Any) can't
+// serialize here since `parts` is a List<PartETag>, not a String like the other
+// upload calls' bodies — kotlinx.serialization has no serializer for `Any`.
+@Serializable
+data class CompleteRequest(val uploadId: String, val parts: List<PartETag>)

@@ -54,6 +54,63 @@ class DriveApiTest {
         assertEquals(1024L, res.used)
     }
 
+    @Test
+    fun `parses an UploadUrlResponse for a single-PUT (non-multipart) upload`() {
+        val sample = """
+            {"id":"f1","key":"owners/o1/f1","url":"https://s3.example.com/put","headers":{"x-amz-server-side-encryption":"AES256"},"vault":false}
+        """.trimIndent()
+        val res = json.decodeFromString<UploadUrlResponse>(sample)
+        assertEquals("f1", res.id)
+        assertEquals("owners/o1/f1", res.key)
+        assertEquals("https://s3.example.com/put", res.url)
+        assertEquals(false, res.multipart)
+        assertNull(res.uploadId)
+        assertNull(res.partSize)
+        assertNull(res.parts)
+        assertEquals(false, res.vault)
+    }
+
+    @Test
+    fun `parses an UploadUrlResponse for a multipart upload`() {
+        val sample = """
+            {"id":"f1","key":"owners/o1/f1","multipart":true,"uploadId":"up_1","partSize":8388608,"parts":4,"vault":true}
+        """.trimIndent()
+        val res = json.decodeFromString<UploadUrlResponse>(sample)
+        assertEquals(true, res.multipart)
+        assertEquals("up_1", res.uploadId)
+        assertEquals(8388608L, res.partSize)
+        assertEquals(4, res.parts)
+        assertEquals(true, res.vault)
+        assertNull(res.url)
+    }
+
+    @Test
+    fun `parses a PartsResponse`() {
+        val sample = """{"urls":{"1":"https://s3.example.com/part1","2":"https://s3.example.com/part2"}}"""
+        val res = json.decodeFromString<PartsResponse>(sample)
+        assertEquals("https://s3.example.com/part1", res.urls["1"])
+        assertEquals(2, res.urls.size)
+    }
+
+    @Test
+    fun `uploadAbort swallows a failing HTTP response instead of throwing`() = runBlocking {
+        val client = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(500)
+                    .message("Internal Server Error")
+                    .body("""{"error":"boom"}""".toResponseBody("application/json".toMediaType()))
+                    .build()
+            }
+            .build()
+        val api = DriveApi(baseUrl = "https://example.com", client = client)
+
+        // Must not throw, even though the underlying call fails with a 500.
+        api.uploadAbort("f1", "up_1")
+    }
+
     /**
      * Confirms the tokenProvider-based constructor still deserializes real responses correctly,
      * and — the actual point of the refactor — reads the token fresh on every call rather than

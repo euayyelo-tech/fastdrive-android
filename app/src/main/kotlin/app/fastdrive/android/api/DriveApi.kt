@@ -79,4 +79,48 @@ class DriveApi(
         withContext(Dispatchers.IO) {
             call("/api/files?folder=")
         }
+
+    // Upload protocol, mirroring app/api/files/{upload-url,[id]/parts,[id]/complete,
+    // [id]/confirm,[id]/abort}/route.ts field-for-field (verified by reading those
+    // route handlers directly, not transcribed from a plan document).
+    suspend fun uploadUrl(
+        name: String, contentType: String, size: Long, folder: String,
+        multipart: Boolean, mtime: String? = null, sha256: String? = null, replace: String? = null,
+    ): UploadUrlResponse = withContext(Dispatchers.IO) {
+        val body = buildMap {
+            put("name", name); put("contentType", contentType); put("size", size.toString())
+            put("folder", folder); put("multipart", multipart.toString())
+            mtime?.let { put("mtime", it) }; sha256?.let { put("sha256", it) }; replace?.let { put("replace", it) }
+        }
+        call("/api/files/upload-url", "POST", json.encodeToString(body))
+    }
+
+    suspend fun uploadParts(id: String, uploadId: String, from: Int, to: Int): PartsResponse =
+        withContext(Dispatchers.IO) {
+            call("/api/files/$id/parts", "POST", json.encodeToString(mapOf("uploadId" to uploadId, "from" to from.toString(), "to" to to.toString())))
+        }
+
+    suspend fun uploadComplete(id: String, uploadId: String, parts: List<PartETag>) {
+        withContext(Dispatchers.IO) {
+            // A plain mapOf(String to Any) here (mixing the uploadId string with the
+            // parts list) has no kotlinx.serialization serializer for `Any` and fails
+            // at runtime, so this request body needs its own @Serializable class
+            // rather than the mapOf shortcut the other four upload calls use.
+            call<Unit>("/api/files/$id/complete", "POST", json.encodeToString(CompleteRequest(uploadId, parts)))
+        }
+    }
+
+    suspend fun uploadConfirm(id: String) {
+        withContext(Dispatchers.IO) { call<Unit>("/api/files/$id/confirm", "POST") }
+    }
+
+    // Best-effort by design (matches [id]/abort/route.ts, which itself always
+    // returns { ok: true } even for an unknown file/uploadId): a failed abort call
+    // is swallowed here so every caller gets that behavior for free, rather than
+    // needing to remember to wrap it themselves.
+    suspend fun uploadAbort(id: String, uploadId: String) {
+        withContext(Dispatchers.IO) {
+            runCatching { call<Unit>("/api/files/$id/abort", "POST", json.encodeToString(mapOf("uploadId" to uploadId))) }
+        }
+    }
 }
