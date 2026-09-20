@@ -14,6 +14,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -28,9 +29,15 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import app.fastdrive.android.api.DriveApi
 import app.fastdrive.android.sync.InstantSyncService
+import app.fastdrive.android.sync.PauseCondition
+import app.fastdrive.android.sync.PauseResumeWorker
 import app.fastdrive.android.sync.PeriodicSyncWorker
 import app.fastdrive.android.sync.SyncMode
 import app.fastdrive.android.sync.SyncSettings
+import app.fastdrive.android.sync.WifiResumeWatcher
+import java.text.DateFormat
+import java.util.Date
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
 
 /** Result of fetching [DriveApi.whoami] for the quota display at the bottom of this screen. */
@@ -74,11 +81,37 @@ private suspend fun fetchQuota(api: DriveApi): QuotaUiState = try {
  * noticed to have run.
  */
 @Composable
-fun SyncSettingsScreen(syncSettings: SyncSettings, api: DriveApi) {
+fun SyncSettingsScreen(
+    syncSettings: SyncSettings,
+    api: DriveApi,
+    wifiResumeWatcher: WifiResumeWatcher,
+    requestSpecificWifiLocationPermission: (onGranted: () -> Unit, onDenied: () -> Unit) -> Unit,
+) {
     val context = LocalContext.current
     var folderUri by remember { mutableStateOf(syncSettings.getFolderUri()) }
     var syncMode by remember { mutableStateOf(syncSettings.getSyncMode()) }
     var quotaState by remember { mutableStateOf<QuotaUiState>(QuotaUiState.Loading) }
+    var pauseCondition by remember { mutableStateOf(syncSettings.getPauseCondition()) }
+    var specificWifiSsid by remember { mutableStateOf("") }
+    // Shown when the user picks specific-Wi-Fi and denies the location permission Task 4's
+    // MainActivity.requestSpecificWifiLocationPermission() requests — per the spec, this never
+    // silently falls back to a different pause condition, it just tells the user and leaves them
+    // free to pick another option (or retry the same one, which re-prompts).
+    var wifiPermissionDenied by remember { mutableStateOf(false) }
+
+    // Applies a non-timer pause condition (AnyWifi/SpecificWifi/Manual): persists it, re-asserts
+    // both trigger mechanisms (they gate on SyncSettings.isPaused()), and (re)starts the Wi-Fi
+    // watcher — WifiResumeWatcher.start() stops any previously-running watcher first regardless of
+    // the new condition's type, so this also correctly tears down a watcher left over from a prior
+    // AnyWifi/SpecificWifi pause when switching to Manual.
+    fun applyPause(condition: PauseCondition) {
+        syncSettings.setPauseCondition(condition)
+        PeriodicSyncWorker.applySettings(context, syncSettings)
+        InstantSyncService.applySettings(context, syncSettings)
+        wifiResumeWatcher.start(syncSettings, condition)
+        pauseCondition = condition
+        wifiPermissionDenied = false
+    }
 
     LaunchedEffect(Unit) { quotaState = fetchQuota(api) }
 
@@ -172,7 +205,103 @@ fun SyncSettingsScreen(syncSettings: SyncSettings, api: DriveApi) {
                     modifier = Modifier.padding(top = 4.dp),
                 )
         }
+
+        HorizontalDivider(modifier = Modifier.padding(vertical = 24.dp))
+
+        Text("Pause sync", style = MaterialTheme.typography.titleMedium)
+
+        val activeCondition = pauseCondition
+        if (activeCondition == null) {
+            Button(
+                modifier = Modifier.padding(top = 8.dp),
+                onClick = {
+                    PauseResumeWorker.pauseForDuration(context, syncSettings, TimeUnit.HOURS.toMillis(1))
+                    // Timer/Manual conditions never need the watcher, but a previous AnyWifi/
+                    // SpecificWifi pause could still have one registered — tear it down so it can't
+                    // race this new Timer pause by firing and clearing it early.
+                    wifiResumeWatcher.stop()
+                    pauseCondition = syncSettings.getPauseCondition()
+                    wifiPermissionDenied = false
+                },
+            ) { Text("Pause for 1 hour") }
+
+            Button(
+                modifier = Modifier.padding(top = 8.dp),
+                onClick = {
+                    PauseResumeWorker.pauseUntilTomorrowMorning(context, syncSettings)
+                    wifiResumeWatcher.stop()
+                    pauseCondition = syncSettings.getPauseCondition()
+                    wifiPermissionDenied = false
+                },
+            ) { Text("Pause until tomorrow morning") }
+
+            Button(
+                modifier = Modifier.padding(top = 8.dp),
+                onClick = { applyPause(PauseCondition.AnyWifi) },
+            ) { Text("Pause until connected to any Wi-Fi") }
+
+            OutlinedTextField(
+                value = specificWifiSsid,
+                onValueChange = {
+                    specificWifiSsid = it
+                    wifiPermissionDenied = false
+                },
+                label = { Text("Wi-Fi network name (SSID)") },
+                modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
+            )
+            Button(
+                modifier = Modifier.padding(top = 8.dp),
+                enabled = specificWifiSsid.isNotBlank(),
+                onClick = {
+                    val ssid = specificWifiSsid.trim()
+                    // Ask for Task 4's location permission BEFORE storing a SpecificWifi condition
+                    // — otherwise WifiResumeWatcher would register a callback that can never read a
+                    // real SSID and this pause would never auto-resume.
+                    requestSpecificWifiLocationPermission(
+                        { applyPause(PauseCondition.SpecificWifi(ssid)) },
+                        { wifiPermissionDenied = true },
+                    )
+                },
+            ) { Text("Pause until connected to this Wi-Fi") }
+            if (wifiPermissionDenied) {
+                Text(
+                    "Location permission is needed to detect this Wi-Fi network. Grant it to use " +
+                        "this option, or pick a different one below.",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+            }
+
+            Button(
+                modifier = Modifier.padding(top = 8.dp),
+                onClick = { applyPause(PauseCondition.Manual) },
+            ) { Text("Pause indefinitely") }
+        } else {
+            Text(pauseStatusText(activeCondition), modifier = Modifier.padding(top = 8.dp))
+            Button(
+                modifier = Modifier.padding(top = 8.dp),
+                onClick = {
+                    PauseResumeWorker.resumeNow(
+                        context,
+                        syncSettings,
+                        onNetworkWatcherTeardown = { wifiResumeWatcher.stop() },
+                    )
+                    pauseCondition = null
+                    wifiPermissionDenied = false
+                },
+            ) { Text("Resume now") }
+        }
     }
+}
+
+/** Plain-language status shown while [PauseCondition] is active, per the spec's exact examples. */
+private fun pauseStatusText(condition: PauseCondition): String = when (condition) {
+    is PauseCondition.Timer ->
+        "Paused until " + DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(condition.resumeAtMillis))
+    is PauseCondition.AnyWifi -> "Paused until connected to Wi-Fi"
+    is PauseCondition.SpecificWifi -> "Paused until connected to '${condition.ssid}'"
+    is PauseCondition.Manual -> "Paused"
 }
 
 @Composable

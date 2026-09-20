@@ -151,7 +151,12 @@ class MainActivity : ComponentActivity() {
                             )
                         }
                         composable("sync_settings") {
-                            SyncSettingsScreen(syncSettings = syncSettings, api = api)
+                            SyncSettingsScreen(
+                                syncSettings = syncSettings,
+                                api = api,
+                                wifiResumeWatcher = wifiResumeWatcher,
+                                requestSpecificWifiLocationPermission = ::requestSpecificWifiLocationPermission,
+                            )
                         }
                     }
                 }
