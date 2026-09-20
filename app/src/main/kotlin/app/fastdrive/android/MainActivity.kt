@@ -109,9 +109,15 @@ class MainActivity : ComponentActivity() {
         // Phase 4 Task 4: if a Wi-Fi-based pause was still active when the app last closed,
         // re-arm the watcher now — otherwise it would only resume the next time the app happens
         // to be foregrounded while already on the target network, rather than watching for it.
+        //
+        // Round 2 (Bug 2): evaluateExistingConnection = true here, unlike the settings screen's
+        // own call. This is an EXISTING pause being re-checked, not one being set right now — if
+        // the device is already on the network the user has been waiting for (paused "until
+        // connected to HomeWifi" yesterday, killed, opened today while on HomeWifi), that pause
+        // must resolve immediately rather than be ignored until some future reconnection.
         val pauseCondition = syncSettings.getPauseCondition()
         if (pauseCondition is PauseCondition.AnyWifi || pauseCondition is PauseCondition.SpecificWifi) {
-            wifiResumeWatcher.start(syncSettings, pauseCondition)
+            wifiResumeWatcher.start(syncSettings, pauseCondition, evaluateExistingConnection = true)
         }
 
         setContent {

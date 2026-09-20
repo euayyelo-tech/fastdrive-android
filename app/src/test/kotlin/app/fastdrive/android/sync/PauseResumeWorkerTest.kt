@@ -19,6 +19,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
 
 @RunWith(RobolectricTestRunner::class)
 class PauseResumeWorkerTest {
@@ -63,6 +64,78 @@ class PauseResumeWorkerTest {
         assertTrue(
             "periodic work should be re-enqueued once the timer clears the pause",
             isPeriodicWorkActive(workManager),
+        )
+    }
+
+    // Round 2, Bug 1: the real firing path. WorkManager runs this worker AT or AFTER
+    // resumeAtMillis, so by the time doWork() looks, the stored Timer has always already elapsed.
+    // The previous round's self-healing getPauseCondition() hid exactly that state from the
+    // worker, so its `is Timer` branch never ran and neither trigger mechanism was ever
+    // re-applied: SyncSettings reported "not paused" while periodic work stayed cancelled and the
+    // instant service stayed stopped until the user reopened the app. The old test above only
+    // covered a still-FUTURE timer, which is the one case that never happens in production —
+    // hence these two.
+
+    @Test
+    fun `an elapsed timer re-enqueues periodic work when the worker fires`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        WorkManagerTestInitHelper.initializeTestWorkManager(context)
+        val workManager = WorkManager.getInstance(context)
+
+        val syncSettings = SyncSettings(context)
+        syncSettings.setFolderUri(Uri.parse("content://fake/tree/1"))
+        syncSettings.setSyncMode(SyncMode.BATTERY_FRIENDLY)
+        // Paused for a minute, both mechanisms torn down the way pauseForDuration leaves them...
+        syncSettings.setPauseCondition(PauseCondition.Timer(System.currentTimeMillis() + 60_000L))
+        PeriodicSyncWorker.applySettings(context, syncSettings)
+        assertFalse(isPeriodicWorkActive(workManager))
+        // ...and now that minute has passed, which is when WorkManager actually runs this worker.
+        syncSettings.setPauseCondition(PauseCondition.Timer(System.currentTimeMillis() - 1_000L))
+        assertNull("an elapsed timer must already read as not-paused", syncSettings.getPauseCondition())
+        assertFalse(
+            "but nothing has re-applied settings yet — this is the state the worker fires in",
+            isPeriodicWorkActive(workManager),
+        )
+
+        val result = buildWorker(context).doWork()
+
+        assertTrue(result is ListenableWorker.Result.Success)
+        assertNull(syncSettings.getPauseCondition())
+        assertNull(
+            "the worker, not a read, is what clears the stored condition",
+            syncSettings.getStoredPauseCondition(),
+        )
+        assertTrue(
+            "periodic work must actually be re-enqueued once the timer elapses",
+            isPeriodicWorkActive(workManager),
+        )
+    }
+
+    @Test
+    fun `an elapsed timer restarts the instant service when the worker fires`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        WorkManagerTestInitHelper.initializeTestWorkManager(context)
+
+        val syncSettings = SyncSettings(context)
+        syncSettings.setFolderUri(Uri.parse("content://fake/tree/1"))
+        syncSettings.setSyncMode(SyncMode.INSTANT)
+        syncSettings.setPauseCondition(PauseCondition.Timer(System.currentTimeMillis() + 60_000L))
+        InstantSyncService.applySettings(context, syncSettings)
+        // Paused, so applySettings only ever called stop() — nothing has been *started* yet, so
+        // the assertion below can only see a start issued by the worker itself.
+        assertNull(
+            "nothing should be started while paused",
+            shadowOf(context).peekNextStartedService(),
+        )
+        syncSettings.setPauseCondition(PauseCondition.Timer(System.currentTimeMillis() - 1_000L))
+
+        val result = buildWorker(context).doWork()
+
+        assertTrue(result is ListenableWorker.Result.Success)
+        assertEquals(
+            "the instant service must actually be restarted once the timer elapses",
+            InstantSyncService::class.java.name,
+            shadowOf(context).nextStartedService?.component?.className,
         )
     }
 

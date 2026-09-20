@@ -108,7 +108,10 @@ fun SyncSettingsScreen(
         syncSettings.setPauseCondition(condition)
         PeriodicSyncWorker.applySettings(context, syncSettings)
         InstantSyncService.applySettings(context, syncSettings)
-        wifiResumeWatcher.start(syncSettings, condition)
+        // evaluateExistingConnection = false: this is a pause the user is setting RIGHT NOW, so
+        // the network they are already on must not instantly satisfy it (Round 1, Finding #1).
+        // MainActivity's startup re-arm of an already-persisted pause passes true instead.
+        wifiResumeWatcher.start(syncSettings, condition, evaluateExistingConnection = false)
         pauseCondition = condition
         wifiPermissionDenied = false
     }

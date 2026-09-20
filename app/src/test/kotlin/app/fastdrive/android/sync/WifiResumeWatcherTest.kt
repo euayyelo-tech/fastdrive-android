@@ -1,6 +1,15 @@
 package app.fastdrive.android.sync
 
+import android.app.Application
+import android.net.ConnectivityManager
+import android.net.Uri
+import androidx.test.core.app.ApplicationProvider
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import androidx.work.testing.WorkManagerTestInitHelper
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -78,5 +87,126 @@ class WifiResumeWatcherTest {
     fun `no network active before registration means nothing is pre-existing`() {
         val network = ShadowNetwork.newInstance(1)
         assertFalse(isPreExistingConnection(network, null))
+    }
+
+    // Round 2, Bug 2: "already on this network at registration time" means two OPPOSITE things
+    // depending on which call site armed the watcher, so both get an explicit test — from the same
+    // starting state (a Wi-Fi pause stored, the device already on the matching network), to stop
+    // the two from flip-flopping again.
+
+    private fun pausedSettings(context: Application, condition: PauseCondition): SyncSettings {
+        WorkManagerTestInitHelper.initializeTestWorkManager(context)
+        val syncSettings = SyncSettings(context)
+        syncSettings.setFolderUri(Uri.parse("content://fake/tree/1"))
+        syncSettings.setSyncMode(SyncMode.BATTERY_FRIENDLY)
+        syncSettings.setPauseCondition(condition)
+        PeriodicSyncWorker.applySettings(context, syncSettings)
+        return syncSettings
+    }
+
+    private fun isPeriodicWorkActive(context: Application): Boolean {
+        val infos = WorkManager.getInstance(context)
+            .getWorkInfosForUniqueWork(PeriodicSyncWorker.WORK_NAME).get()
+        return infos.isNotEmpty() && infos.any { it.state == WorkInfo.State.ENQUEUED }
+    }
+
+    @Test
+    fun `Situation A - a pause set while already on the target network is NOT instantly cleared`() {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val syncSettings = pausedSettings(context, PauseCondition.AnyWifi)
+        assertFalse(isPeriodicWorkActive(context))
+        val watcher = WifiResumeWatcher(context)
+        val alreadyConnected = ShadowNetwork.newInstance(1)
+
+        // Exactly what SyncSettingsScreen.applyPause's registration delivers synchronously: the
+        // network that was already active, which start(evaluateExistingConnection = false)
+        // captured as the baseline to ignore.
+        val resolved = watcher.handleNetworkCandidate(
+            syncSettings,
+            PauseCondition.AnyWifi,
+            network = alreadyConnected,
+            baselineNetwork = alreadyConnected,
+            connectedSsid = "HomeWifi",
+        )
+
+        assertFalse(resolved)
+        assertEquals(PauseCondition.AnyWifi, syncSettings.getPauseCondition())
+        assertFalse("the pause the user just set must still be in force", isPeriodicWorkActive(context))
+    }
+
+    @Test
+    fun `Situation B - re-arming an existing pause while already on the target network resolves it`() {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val syncSettings = pausedSettings(context, PauseCondition.SpecificWifi("HomeWifi"))
+        assertFalse(isPeriodicWorkActive(context))
+        val watcher = WifiResumeWatcher(context)
+        val alreadyConnected = ShadowNetwork.newInstance(1)
+
+        // MainActivity.onCreate's re-arm passes evaluateExistingConnection = true, i.e. no
+        // baseline to ignore — so the very same delivery as Situation A must resolve the pause.
+        val resolved = watcher.handleNetworkCandidate(
+            syncSettings,
+            PauseCondition.SpecificWifi("HomeWifi"),
+            network = alreadyConnected,
+            baselineNetwork = null,
+            connectedSsid = "\"HomeWifi\"",
+        )
+
+        assertTrue(resolved)
+        assertNull(syncSettings.getPauseCondition())
+        assertTrue(
+            "yesterday's Wi-Fi pause must actually restart sync, not wait for a reconnection",
+            isPeriodicWorkActive(context),
+        )
+    }
+
+    @Test
+    fun `a non-matching network never resolves the pause in either mode`() {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val syncSettings = pausedSettings(context, PauseCondition.SpecificWifi("HomeWifi"))
+        val watcher = WifiResumeWatcher(context)
+
+        val resolved = watcher.handleNetworkCandidate(
+            syncSettings,
+            PauseCondition.SpecificWifi("HomeWifi"),
+            network = ShadowNetwork.newInstance(2),
+            baselineNetwork = null,
+            connectedSsid = "CoffeeShopWifi",
+        )
+
+        assertFalse(resolved)
+        assertEquals(PauseCondition.SpecificWifi("HomeWifi"), syncSettings.getPauseCondition())
+    }
+
+    @Test
+    fun `start captures a baseline to ignore only when not evaluating the existing connection`() {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val syncSettings = pausedSettings(context, PauseCondition.AnyWifi)
+        val activeNetwork = context.getSystemService(ConnectivityManager::class.java).activeNetwork
+        val watcher = WifiResumeWatcher(context)
+
+        // MainActivity's startup re-arm: nothing is ignored, so an already-matching network
+        // resolves the pause (Situation B above proves what that then does).
+        watcher.start(syncSettings, PauseCondition.AnyWifi, evaluateExistingConnection = true)
+        assertNull(watcher.ignoredBaselineNetwork)
+        watcher.stop()
+
+        // SyncSettingsScreen.applyPause: whatever the device is on right now is ignored
+        // (Situation A above proves what that then does).
+        watcher.start(syncSettings, PauseCondition.AnyWifi, evaluateExistingConnection = false)
+        assertEquals(activeNetwork, watcher.ignoredBaselineNetwork)
+        watcher.stop()
+    }
+
+    @Test
+    fun `start ignores a condition that is not Wi-Fi based`() {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val syncSettings = pausedSettings(context, PauseCondition.Manual)
+        val watcher = WifiResumeWatcher(context)
+
+        watcher.start(syncSettings, PauseCondition.Manual, evaluateExistingConnection = true)
+
+        assertNull(watcher.ignoredBaselineNetwork)
+        assertEquals(PauseCondition.Manual, syncSettings.getPauseCondition())
     }
 }

@@ -173,6 +173,46 @@ class SyncSettingsTest {
         assertTrue(settings.isPaused())
     }
 
+    // Round 2, Bug 1: that self-heal must be a pure READ. When it also cleared the stored value,
+    // PauseResumeWorker — which fires precisely when the timer has elapsed and reads the same
+    // storage — found nothing left to act on and never re-applied the trigger mechanisms.
+
+    @Test
+    fun `the expired-timer self-heal does not clear what is stored`() {
+        val resumeAtMillis = System.currentTimeMillis() - 1_000L
+        settings.setPauseCondition(PauseCondition.Timer(resumeAtMillis))
+
+        assertNull("reads as not paused", settings.getPauseCondition())
+        assertFalse(settings.isPaused())
+        assertEquals(
+            "but the stored Timer survives for PauseResumeWorker to act on",
+            PauseCondition.Timer(resumeAtMillis),
+            settings.getStoredPauseCondition(),
+        )
+        // Still true after any number of reads — nothing here writes.
+        assertNull(settings.getPauseCondition())
+        assertEquals(PauseCondition.Timer(resumeAtMillis), settings.getStoredPauseCondition())
+    }
+
+    @Test
+    fun `getStoredPauseCondition matches getPauseCondition for every non-expired condition`() {
+        val resumeAtMillis = System.currentTimeMillis() + 60_000L
+        settings.setPauseCondition(PauseCondition.Timer(resumeAtMillis))
+        assertEquals(settings.getPauseCondition(), settings.getStoredPauseCondition())
+
+        settings.setPauseCondition(PauseCondition.AnyWifi)
+        assertEquals(settings.getPauseCondition(), settings.getStoredPauseCondition())
+
+        settings.setPauseCondition(PauseCondition.SpecificWifi("HomeWifi"))
+        assertEquals(settings.getPauseCondition(), settings.getStoredPauseCondition())
+
+        settings.setPauseCondition(PauseCondition.Manual)
+        assertEquals(settings.getPauseCondition(), settings.getStoredPauseCondition())
+
+        settings.setPauseCondition(null)
+        assertNull(settings.getStoredPauseCondition())
+    }
+
     // Finding #2 (Phase 4 fix round): clearAccountState() (the shared sign-out path) must not
     // leave a pause condition set by the previous account for the next one to inherit, and must
     // cancel any pending PauseResumeWorker timer job too.

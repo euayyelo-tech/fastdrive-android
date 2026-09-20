@@ -14,19 +14,27 @@ import java.util.concurrent.TimeUnit
  * [pauseForDuration] (and, via it, [pauseUntilTomorrowMorning]) to fire once the paused duration
  * elapses.
  *
- * It only ever clears a still-active [PauseCondition.Timer] — if the pause condition changed to
- * something else before this fired (the user picked a different pause condition, or called
- * [resumeNow] and this job's cancellation lost a race with its own firing), doing nothing here is
- * correct: whatever is currently set is the user's latest intent, not this stale timer's.
+ * It acts only when a [PauseCondition.Timer] is what is actually stored — if the pause condition
+ * changed to something else before this fired (the user picked a different pause condition, or
+ * called [resumeNow] and this job's cancellation lost a race with its own firing), doing nothing
+ * here is correct: whatever is currently set is the user's latest intent, not this stale timer's.
+ * Whether that stored Timer's deadline has passed is deliberately NOT part of the check — it
+ * always has by the time WorkManager runs this, and making the check depend on it is what broke
+ * timer auto-resume in the previous round (see [doWork]).
  */
 class PauseResumeWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
         val syncSettings = SyncSettings(applicationContext)
-        val condition = syncSettings.getPauseCondition()
-        if (condition is PauseCondition.Timer) {
-            syncSettings.setPauseCondition(null)
-            PeriodicSyncWorker.applySettings(applicationContext, syncSettings)
-            InstantSyncService.applySettings(applicationContext, syncSettings)
+        // Round 2 (Bug 1): read the RAW stored condition, not SyncSettings.getPauseCondition().
+        // This worker fires at or after resumeAtMillis, which is exactly the state
+        // getPauseCondition()'s expiry guard hides ("an elapsed Timer reads as not paused") — so
+        // reading through it meant this `is Timer` check never matched on the real firing path and
+        // neither applySettings() below ever ran, leaving sync stopped until the user reopened the
+        // app. The stored value is still checked (rather than resuming unconditionally) for the
+        // reason in this class's doc comment: if the user replaced the Timer with a different
+        // pause condition before this fired, that newer intent must survive this stale job.
+        if (syncSettings.getStoredPauseCondition() is PauseCondition.Timer) {
+            clearPauseAndReapply(applicationContext, syncSettings)
         }
         return Result.success()
     }
@@ -95,6 +103,20 @@ class PauseResumeWorker(context: Context, params: WorkerParameters) : CoroutineW
         ) {
             WorkManager.getInstance(context).cancelUniqueWork(PAUSE_RESUME_WORK_NAME)
             onNetworkWatcherTeardown?.invoke()
+            clearPauseAndReapply(context, syncSettings)
+        }
+
+        /**
+         * The shared tail of every resume path: drop the stored pause condition, then re-apply
+         * settings to BOTH trigger mechanisms so whichever one the user's [SyncMode] selects
+         * actually starts again. Shared between [resumeNow] and [doWork] so a resume can never
+         * again re-apply one mechanism (or neither) and leave the other stopped.
+         *
+         * [doWork] deliberately calls this rather than [resumeNow]: cancelling
+         * [PAUSE_RESUME_WORK_NAME] from inside that very job would cancel the running worker
+         * itself, and there is no network watcher to tear down for a [PauseCondition.Timer].
+         */
+        internal fun clearPauseAndReapply(context: Context, syncSettings: SyncSettings) {
             syncSettings.setPauseCondition(null)
             PeriodicSyncWorker.applySettings(context, syncSettings)
             InstantSyncService.applySettings(context, syncSettings)

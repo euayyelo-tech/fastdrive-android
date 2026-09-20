@@ -83,7 +83,40 @@ class SyncSettings(context: Context) {
      * one exception, because [Cursor] is already `@Serializable` for the API layer it comes from).
      */
     fun getPauseCondition(): PauseCondition? {
-        val condition = when (prefs.getString(KEY_PAUSE_TYPE, null)) {
+        val condition = getStoredPauseCondition()
+        // Finding #5 (Phase 4 fix round): a Timer whose resumeAtMillis has already passed must
+        // never be trusted as still "paused" — e.g. if the PauseResumeWorker job that was supposed
+        // to clear it was somehow lost (WorkManager DB wiped, an OEM battery killer, etc). Placed
+        // here, the one place every "is sync paused right now?" caller (the UI, isPaused(), and
+        // through it both applySettings() gates) reads the pause condition through, so the guard
+        // applies everywhere without duplicating it at each call site.
+        //
+        // Round 2 (Bug 1): this guard used to ALSO clear the stored value as a side effect of
+        // being read. That silently broke timer auto-resume: PauseResumeWorker.doWork() fires at
+        // (or after) resumeAtMillis and read the condition through this same function, so the
+        // self-heal had always already nulled it out by the time the worker checked `is Timer`,
+        // the worker's re-apply branch never ran, and the periodic work stayed cancelled / the
+        // instant service stayed stopped until the user reopened the app. The self-heal is now a
+        // pure read — it changes what callers SEE, never what is stored. Clearing stored state is
+        // left to the two things that actually own a resume (PauseResumeWorker.doWork and
+        // resumeNow), so nothing can race a read against a write here.
+        if (condition is PauseCondition.Timer && condition.resumeAtMillis <= System.currentTimeMillis()) {
+            return null
+        }
+        return condition
+    }
+
+    /**
+     * The pause condition exactly as stored, with no expiry interpretation — an elapsed
+     * [PauseCondition.Timer] still comes back as that `Timer`.
+     *
+     * Only [PauseResumeWorker] should use this: it is the timer-resume worker itself, so "a Timer
+     * whose deadline has passed" is precisely the state it exists to act on, and it must be able
+     * to see it rather than having [getPauseCondition]'s expiry guard hide it first. Every other
+     * caller wants [getPauseCondition] / [isPaused] — "is sync paused right now".
+     */
+    fun getStoredPauseCondition(): PauseCondition? {
+        return when (prefs.getString(KEY_PAUSE_TYPE, null)) {
             PAUSE_TYPE_TIMER -> {
                 val resumeAtMillis = prefs.getLong(KEY_PAUSE_RESUME_AT, -1L)
                 if (resumeAtMillis < 0) null else PauseCondition.Timer(resumeAtMillis)
@@ -96,16 +129,6 @@ class SyncSettings(context: Context) {
             PAUSE_TYPE_MANUAL -> PauseCondition.Manual
             else -> null
         }
-        // Finding #5 (Phase 4 fix round): a Timer whose resumeAtMillis has already passed must
-        // never be trusted as still "paused" — e.g. if the PauseResumeWorker job that was supposed
-        // to clear it was somehow lost (WorkManager DB wiped, an OEM battery killer, etc). Placed
-        // here, the one place every caller (including isPaused()) reads the pause condition
-        // through, so the guard applies everywhere without duplicating it at each call site.
-        if (condition is PauseCondition.Timer && condition.resumeAtMillis <= System.currentTimeMillis()) {
-            setPauseCondition(null)
-            return null
-        }
-        return condition
     }
 
     fun setPauseCondition(condition: PauseCondition?) {
