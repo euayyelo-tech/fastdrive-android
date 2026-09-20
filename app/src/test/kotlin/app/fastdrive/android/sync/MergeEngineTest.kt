@@ -69,11 +69,31 @@ class MergeEngineTest {
         assertTrue(!same(null, entry("f")))
     }
 
+    @Test
+    fun `same is false for a malformed or empty mtime instead of throwing`() {
+        val good = entry("f", size = 10, mtime = "2026-01-01T00:00:00Z")
+        val malformed = entry("f", size = 10, mtime = "not-a-date")
+        val empty = entry("f", size = 10, mtime = "")
+        assertTrue(!same(good, malformed))
+        assertTrue(!same(malformed, good))
+        assertTrue(!same(malformed, malformed))
+        assertTrue(!same(good, empty))
+        assertTrue(!same(empty, empty))
+    }
+
     // ── conflictName() ──────────────────────────────────────────────────
 
     @Test
     fun `conflictName inserts marker before extension`() {
         assertEquals("docs/report (conflicted copy, PC1).pdf", conflictName("docs/report.pdf", "PC1"))
+    }
+
+    @Test
+    fun `conflictName uses the last dot for a multi-dot filename`() {
+        assertEquals(
+            "archive.tar (conflicted copy, PC1).gz",
+            conflictName("archive.tar.gz", "PC1"),
+        )
     }
 
     @Test
@@ -108,6 +128,34 @@ class MergeEngineTest {
         val gone = listOf(entry("old.txt", sha256 = "h1"))
         val appeared = listOf(entry("new.txt", sha256 = "h2"))
         assertTrue(pairMoves(gone, appeared).isEmpty())
+    }
+
+    @Test
+    fun `pairMoves consumes a hash bucket only once when two appeared entries share it`() {
+        val gone = listOf(entry("old.txt", sha256 = "h1"))
+        val appeared = listOf(
+            entry("new1.txt", sha256 = "h1"),
+            entry("new2.txt", sha256 = "h1"),
+        )
+        val pairs = pairMoves(gone, appeared)
+        assertEquals(1, pairs.size)
+        assertEquals("old.txt", pairs[0].first.path)
+        assertEquals("new1.txt", pairs[0].second.path)
+    }
+
+    @Test
+    fun `pairMoves excludes an id-matched gone entry from the hash matching pool`() {
+        // "old.txt" is matched to "new-by-id.txt" via id, but also shares a sha256 with
+        // "new-by-hash.txt". It must not be double-counted as a hash match too.
+        val gone = listOf(entry("old.txt", id = "id1", sha256 = "h1"))
+        val appeared = listOf(
+            entry("new-by-id.txt", id = "id1", sha256 = "h2"),
+            entry("new-by-hash.txt", sha256 = "h1"),
+        )
+        val pairs = pairMoves(gone, appeared)
+        assertEquals(1, pairs.size)
+        assertEquals("old.txt", pairs[0].first.path)
+        assertEquals("new-by-id.txt", pairs[0].second.path)
     }
 
     // ── plan() ──────────────────────────────────────────────────────────

@@ -57,9 +57,14 @@ fun same(a: Entry?, b: Entry?): Boolean {
     if (a == null || b == null) return a == null && b == null
     if (a.rev != null && b.rev != null && a.rev == b.rev) return true
     if (a.sha256 != null && b.sha256 != null) return a.sha256 == b.sha256
-    if (a.mtime == null || b.mtime == null) return false
-    val deltaMs = abs(Instant.parse(a.mtime).toEpochMilli() - Instant.parse(b.mtime).toEpochMilli())
-    return a.size == b.size && deltaMs < 2000
+    if (a.size != b.size) return false
+    if (a.mtime.isNullOrEmpty() || b.mtime.isNullOrEmpty()) return false
+    val deltaMs = try {
+        abs(Instant.parse(a.mtime).toEpochMilli() - Instant.parse(b.mtime).toEpochMilli())
+    } catch (e: java.time.format.DateTimeParseException) {
+        return false
+    }
+    return deltaMs < 2000
 }
 
 fun conflictName(path: String, machine: String): String {
