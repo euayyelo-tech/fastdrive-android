@@ -1,19 +1,29 @@
 package app.fastdrive.android.ui
 
 import android.content.Context
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -30,6 +40,7 @@ import androidx.work.WorkManager
 import androidx.work.workDataOf
 import app.fastdrive.android.data.CachedFile
 import app.fastdrive.android.download.DownloadWorker
+import app.fastdrive.android.upload.ContentResolverFileAccess
 import java.util.UUID
 
 @Composable
@@ -43,34 +54,60 @@ fun FileListScreen(viewModel: FileListViewModel, baseUrl: String) {
     // does, so a real in-progress download is never lost, just its on-screen indicator.
     val downloadWorkIds = remember { mutableStateMapOf<String, UUID>() }
 
+    // Task 1 only: pick a file and confirm its metadata was read via ContentResolver. Task 3/4
+    // wires this PickedFile into the actual upload protocol.
+    val fileAccess = remember { ContentResolverFileAccess(context.contentResolver) }
+    val pickDocumentLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) {
+            val picked = fileAccess.stat(uri)
+            Toast.makeText(
+                context,
+                "Selected: ${picked.name}, ${picked.size} bytes",
+                Toast.LENGTH_LONG,
+            ).show()
+        }
+    }
+
     LaunchedEffect(Unit) {
         viewModel.refresh()
     }
 
-    Column(modifier = Modifier.fillMaxWidth()) {
-        if (refreshError != null) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(12.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text(refreshError ?: "", modifier = Modifier.padding(end = 8.dp))
-                Button(onClick = { viewModel.refresh() }) {
-                    Text("Retry")
-                }
+    Scaffold(
+        floatingActionButton = {
+            FloatingActionButton(onClick = { pickDocumentLauncher.launch(arrayOf("*/*")) }) {
+                Icon(Icons.Filled.Add, contentDescription = "Upload a file")
             }
-            HorizontalDivider()
-        }
+        },
+    ) { scaffoldPadding ->
+        Box(modifier = Modifier.fillMaxSize().padding(scaffoldPadding)) {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                if (refreshError != null) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(refreshError ?: "", modifier = Modifier.padding(end = 8.dp))
+                        Button(onClick = { viewModel.refresh() }) {
+                            Text("Retry")
+                        }
+                    }
+                    HorizontalDivider()
+                }
 
-        LazyColumn(modifier = Modifier.fillMaxWidth()) {
-            items(files, key = { it.id }) { file ->
-                FileRow(
-                    file = file,
-                    downloadWorkId = downloadWorkIds[file.id],
-                    onClick = { downloadWorkIds[file.id] = enqueueDownload(context, baseUrl, file) },
-                )
-                HorizontalDivider()
+                LazyColumn(modifier = Modifier.fillMaxWidth()) {
+                    items(files, key = { it.id }) { file ->
+                        FileRow(
+                            file = file,
+                            downloadWorkId = downloadWorkIds[file.id],
+                            onClick = { downloadWorkIds[file.id] = enqueueDownload(context, baseUrl, file) },
+                        )
+                        HorizontalDivider()
+                    }
+                }
             }
         }
     }
