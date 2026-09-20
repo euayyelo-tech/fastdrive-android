@@ -1,7 +1,7 @@
 package app.fastdrive.android.ui
 
 import android.content.Context
-import android.widget.Toast
+import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
@@ -27,7 +27,9 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -38,6 +40,7 @@ import androidx.work.workDataOf
 import app.fastdrive.android.data.CachedFile
 import app.fastdrive.android.download.DownloadWorker
 import app.fastdrive.android.upload.ContentResolverFileAccess
+import app.fastdrive.android.upload.UploadWorker
 import java.util.UUID
 
 @Composable
@@ -51,19 +54,16 @@ fun FileListScreen(viewModel: FileListViewModel, baseUrl: String) {
     // does, so a real in-progress download is never lost, just its on-screen indicator.
     val downloadWorkIds = remember { mutableStateMapOf<String, UUID>() }
 
-    // Task 1 only: pick a file and confirm its metadata was read via ContentResolver. Task 3/4
-    // wires this PickedFile into the actual upload protocol.
+    // The most recently enqueued upload's WorkRequest id, so its status can be shown above the
+    // list — same observation approach as each download row's own `downloadWorkIds` entry.
+    var uploadWorkId by remember { mutableStateOf<UUID?>(null) }
+
     val fileAccess = remember { ContentResolverFileAccess(context.contentResolver) }
     val pickDocumentLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri ->
         if (uri != null) {
-            val picked = fileAccess.stat(uri)
-            Toast.makeText(
-                context,
-                "Selected: ${picked.name}, ${picked.size} bytes",
-                Toast.LENGTH_LONG,
-            ).show()
+            uploadWorkId = enqueueUpload(context, baseUrl, uri)
         }
     }
 
@@ -95,6 +95,8 @@ fun FileListScreen(viewModel: FileListViewModel, baseUrl: String) {
                     HorizontalDivider()
                 }
 
+                UploadStatusRow(uploadWorkId)
+
                 LazyColumn(modifier = Modifier.fillMaxWidth()) {
                     items(files, key = { it.id }) { file ->
                         FileRow(
@@ -122,6 +124,45 @@ private fun enqueueDownload(context: Context, baseUrl: String, file: CachedFile)
         .build()
     WorkManager.getInstance(context).enqueue(request)
     return request.id
+}
+
+private fun enqueueUpload(context: Context, baseUrl: String, uri: Uri): UUID {
+    // No folder navigation exists in this screen yet, so every upload lands at the root — the
+    // same default `UploadWorker.doWork()` itself falls back to when "folder" is absent.
+    val request = OneTimeWorkRequestBuilder<UploadWorker>()
+        .setInputData(
+            workDataOf(
+                "uri" to uri.toString(),
+                "folder" to "/",
+                "base_url" to baseUrl,
+            ),
+        )
+        .build()
+    WorkManager.getInstance(context).enqueue(request)
+    return request.id
+}
+
+@Composable
+private fun UploadStatusRow(uploadWorkId: UUID?) {
+    if (uploadWorkId == null) return
+    val context = LocalContext.current
+    val state = WorkManager.getInstance(context)
+        .getWorkInfoByIdFlow(uploadWorkId)
+        .collectAsState(initial = null)
+        .value?.state
+
+    val label = when (state) {
+        WorkInfo.State.ENQUEUED, WorkInfo.State.RUNNING -> "Uploading…"
+        WorkInfo.State.SUCCEEDED -> "Uploaded"
+        WorkInfo.State.FAILED -> "Upload failed"
+        else -> null
+    }
+    if (label != null) {
+        Row(modifier = Modifier.fillMaxWidth().padding(12.dp)) {
+            Text(label)
+        }
+        HorizontalDivider()
+    }
 }
 
 @Composable
