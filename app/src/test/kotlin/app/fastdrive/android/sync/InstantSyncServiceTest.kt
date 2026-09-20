@@ -1,6 +1,6 @@
 package app.fastdrive.android.sync
 
-import android.content.Context
+import android.app.Application
 import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
@@ -33,7 +33,7 @@ class InstantSyncServiceTest {
 
     @Test
     fun `applySettings starts the service when instant mode is chosen with a folder set`() {
-        val context = ApplicationProvider.getApplicationContext<Context>()
+        val context = ApplicationProvider.getApplicationContext<Application>()
         val syncSettings = SyncSettings(context)
         syncSettings.setFolderUri(Uri.parse("content://fake/tree/1"))
         syncSettings.setSyncMode(SyncMode.INSTANT)
@@ -46,7 +46,7 @@ class InstantSyncServiceTest {
 
     @Test
     fun `applySettings stops the service when battery-friendly mode is chosen`() {
-        val context = ApplicationProvider.getApplicationContext<Context>()
+        val context = ApplicationProvider.getApplicationContext<Application>()
         val syncSettings = SyncSettings(context)
         syncSettings.setFolderUri(Uri.parse("content://fake/tree/1"))
         syncSettings.setSyncMode(SyncMode.BATTERY_FRIENDLY)
@@ -62,7 +62,7 @@ class InstantSyncServiceTest {
 
     @Test
     fun `applySettings stops the service when no folder is set even in instant mode`() {
-        val context = ApplicationProvider.getApplicationContext<Context>()
+        val context = ApplicationProvider.getApplicationContext<Application>()
         val syncSettings = SyncSettings(context)
         syncSettings.setSyncMode(SyncMode.INSTANT)
 
