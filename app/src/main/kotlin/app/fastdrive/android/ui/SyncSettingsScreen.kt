@@ -12,10 +12,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -24,10 +26,34 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import app.fastdrive.android.api.DriveApi
 import app.fastdrive.android.sync.InstantSyncService
 import app.fastdrive.android.sync.PeriodicSyncWorker
 import app.fastdrive.android.sync.SyncMode
 import app.fastdrive.android.sync.SyncSettings
+import kotlinx.coroutines.CancellationException
+
+/** Result of fetching [DriveApi.whoami] for the quota display at the bottom of this screen. */
+private sealed interface QuotaUiState {
+    data object Loading : QuotaUiState
+    data class Loaded(val used: Long, val quota: Long) : QuotaUiState
+    data object Error : QuotaUiState
+}
+
+private suspend fun fetchQuota(api: DriveApi): QuotaUiState = try {
+    val response = api.whoami()
+    QuotaUiState.Loaded(response.used, response.quota)
+} catch (e: CancellationException) {
+    // Must propagate, not be swallowed as a fetch failure — same rule this codebase already
+    // applies to runOnePass (see the fix in commit 2e5e6c3): an unguarded catch-all here would
+    // eat structured-concurrency cancellation (e.g. leaving this composable) as if it were a
+    // network error.
+    throw e
+} catch (e: Exception) {
+    // Never let a network/parse failure here take down the rest of the settings screen — the
+    // folder picker and sync-mode controls above must keep working regardless.
+    QuotaUiState.Error
+}
 
 /**
  * Lets the user pick the folder FastDrive syncs into and the sync-frequency mode. Choosing a
@@ -35,12 +61,26 @@ import app.fastdrive.android.sync.SyncSettings
  * WorkManager sync via [PeriodicSyncWorker.applySettings] and stops Task 8's
  * [InstantSyncService]; switching to [SyncMode.INSTANT] starts [InstantSyncService] and cancels
  * the periodic work, so the two modes are always mutually exclusive.
+ *
+ * Also shows a quota/storage-used line fetched from [DriveApi.whoami]. There's no ViewModel or
+ * shared "last sync result" signal anywhere in this codebase yet (`PeriodicSyncWorker` and
+ * `InstantSyncService` run headless with no state exposed back to the UI layer) — building one
+ * just for this display would mean inventing cross-component plumbing this project doesn't have
+ * elsewhere. Instead the fetch runs once whenever this composable enters composition, via
+ * `LaunchedEffect(Unit)`; since Compose Navigation (`NavHost`) recreates a route's composable each
+ * time it's navigated to rather than keeping it alive in the back stack, simply reopening Settings
+ * from the file list already re-fetches fresh quota data — covering both "on screen open" and, in
+ * practice, "after a sync pass completes" for the common case of checking Settings once a sync is
+ * noticed to have run.
  */
 @Composable
-fun SyncSettingsScreen(syncSettings: SyncSettings) {
+fun SyncSettingsScreen(syncSettings: SyncSettings, api: DriveApi) {
     val context = LocalContext.current
     var folderUri by remember { mutableStateOf(syncSettings.getFolderUri()) }
     var syncMode by remember { mutableStateOf(syncSettings.getSyncMode()) }
+    var quotaState by remember { mutableStateOf<QuotaUiState>(QuotaUiState.Loading) }
+
+    LaunchedEffect(Unit) { quotaState = fetchQuota(api) }
 
     val folderPickerLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocumentTree(),
@@ -103,6 +143,35 @@ fun SyncSettingsScreen(syncSettings: SyncSettings) {
                 InstantSyncService.applySettings(context, syncSettings)
             },
         )
+
+        HorizontalDivider(modifier = Modifier.padding(vertical = 24.dp))
+
+        Text("Storage", style = MaterialTheme.typography.titleMedium)
+        when (val state = quotaState) {
+            is QuotaUiState.Loading ->
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(top = 8.dp))
+            is QuotaUiState.Loaded -> {
+                val fraction = if (state.quota > 0) {
+                    (state.used.toFloat() / state.quota.toFloat()).coerceIn(0f, 1f)
+                } else {
+                    0f
+                }
+                LinearProgressIndicator(
+                    progress = { fraction },
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                )
+                Text(
+                    formatQuota(state.used, state.quota),
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+            }
+            is QuotaUiState.Error ->
+                Text(
+                    "Couldn't load storage usage",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+        }
     }
 }
 

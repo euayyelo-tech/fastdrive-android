@@ -101,7 +101,7 @@ class MainActivity : ComponentActivity() {
                             )
                         }
                         composable("sync_settings") {
-                            SyncSettingsScreen(syncSettings = syncSettings)
+                            SyncSettingsScreen(syncSettings = syncSettings, api = api)
                         }
                     }
                 }
