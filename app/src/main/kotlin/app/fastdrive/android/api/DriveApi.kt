@@ -31,10 +31,12 @@ class DriveApi(
     private val client: OkHttpClient = OkHttpClient(),
 ) : DownloadUrlProvider {
     private val json = Json { ignoreUnknownKeys = true }
-    // Distinct from `json` (encodeDefaults defaults to true, which is fine for the fixed-shape
-    // request bodies elsewhere in this file) — UpdateFileRequest's fields are individually
-    // optional per the server's PATCH contract, so a field the caller left null must be OMITTED
-    // from the JSON entirely, not sent as an explicit `null`.
+    // Distinct from `json` — but NOT because of encodeDefaults, which defaults to false in
+    // kotlinx.serialization already (default-valued properties are omitted from either instance's
+    // output). What differs is explicitNulls: `json`'s default (true) would still emit an explicit
+    // `"folder":null` for a field the caller left null, but UpdateFileRequest's fields are
+    // individually optional per the server's PATCH contract, so a left-null field must be OMITTED
+    // from the JSON entirely — hence explicitNulls = false here.
     private val jsonOmitNulls = Json { explicitNulls = false }
 
     private inline fun <reified T> call(path: String, method: String = "GET", body: String? = null): T {

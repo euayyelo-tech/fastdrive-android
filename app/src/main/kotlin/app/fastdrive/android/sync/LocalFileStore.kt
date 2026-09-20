@@ -8,6 +8,12 @@ import androidx.documentfile.provider.DocumentFile
 import java.io.IOException
 import java.io.OutputStream
 
+/** Where [DocumentTreeFileStore.trash] parks a machine-deleted file, and the prefix
+ *  [SyncOrchestrator] filters out of the scan's reported `skipped` list — it's an internal
+ *  bookkeeping folder [unsyncable] correctly hides from sync, not something the user needs to be
+ *  told "couldn't be synced". */
+const val TRASH_DIR = ".fastdrive-trash"
+
 /**
  * The write operations [SyncOrchestrator] needs against the user's picked sync folder — the
  * counterpart to [LocalScanner]'s read-only [TreeNode] seam over the same tree. [SyncOrchestrator]
@@ -66,8 +72,13 @@ class DocumentTreeFileStore(private val context: Context, rootUri: Uri) : LocalF
     }
 
     override fun trash(path: String): Boolean {
+        // Already gone (e.g. the drive told us to delete a file this machine had itself already
+        // lost, or a previous pass's trash of the same path raced with this one): tolerate it as
+        // success rather than a failure that would otherwise be retried forever, the same way the
+        // reference implementation treats an ENOENT on its rename as "nothing to do".
+        if (resolve(path) == null) return true
         val flat = path.replace('/', '_')
-        return move(path, ".fastdrive-trash/${System.currentTimeMillis()}_$flat")
+        return move(path, "$TRASH_DIR/${System.currentTimeMillis()}_$flat")
     }
 
     override fun move(from: String, to: String): Boolean {
@@ -86,7 +97,12 @@ class DocumentTreeFileStore(private val context: Context, rootUri: Uri) : LocalF
         }.getOrNull()
         if (movedUri != null) {
             if (toName != source.name) {
-                DocumentFile.fromSingleUri(context, movedUri)?.let { moved -> runCatching { moved.renameTo(toName) } }
+                // DocumentFile.fromSingleUri(...).renameTo(...) is a no-op/failure here — androidx's
+                // SingleDocumentFile doesn't support renaming a bare content:// document the way a
+                // TreeDocumentFile does. DocumentsContract.renameDocument() is the correct API for
+                // renaming a content:// document URI directly, moved-to-URI or not.
+                val renamed = runCatching { DocumentsContract.renameDocument(resolver, movedUri, toName) }.getOrNull()
+                if (renamed == null) return false
             }
             return true
         }

@@ -101,6 +101,12 @@ interface RemoteDao {
     @Query("SELECT * FROM sync_remote WHERE deleted = 0")
     suspend fun getAll(): List<RemoteEntry>
 
+    /** Unlike [getAll], not filtered by `deleted` — the counterpart of desktop's `remoteById`,
+     *  used by [SyncOrchestrator]'s `mirror()` to read back whatever this table currently has for
+     *  an id (any state) before folding a patch into it. */
+    @Query("SELECT * FROM sync_remote WHERE id = :id")
+    suspend fun findById(id: String): RemoteEntry?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(entry: RemoteEntry)
 

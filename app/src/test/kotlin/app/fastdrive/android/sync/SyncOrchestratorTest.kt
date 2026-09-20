@@ -40,6 +40,7 @@ class SyncOrchestratorTest {
 
     private lateinit var database: AppDatabase
     private lateinit var baseDao: BaseDao
+    private lateinit var remoteDao: RemoteDao
 
     @Before
     fun setUp() {
@@ -48,6 +49,7 @@ class SyncOrchestratorTest {
             AppDatabase::class.java,
         ).allowMainThreadQueries().build()
         baseDao = database.baseDao()
+        remoteDao = database.remoteDao()
     }
 
     @After
@@ -127,6 +129,9 @@ class SyncOrchestratorTest {
                 request.url.encodedPath == "/api/files/id-download/download" ->
                     200 to """{"url":"https://s3.example.com/get-download","vault":false}"""
                 request.url.toString() == "https://s3.example.com/get-download" -> 200 to "downloaded-bytes"
+                request.url.encodedPath == "/api/files/id-conflict-remote/download" ->
+                    200 to """{"url":"https://s3.example.com/get-conflict-remote","vault":false}"""
+                request.url.toString() == "https://s3.example.com/get-conflict-remote" -> 200 to "conflict-remote-bytes"
                 request.url.encodedPath == "/api/files/id-delrem" && request.method == "DELETE" -> 200 to "{}"
                 request.url.encodedPath == "/api/files/id-move" && request.method == "PATCH" -> 200 to "{}"
                 else -> 500 to """{"error":"unexpected ${request.method} ${request.url}"}"""
@@ -167,6 +172,9 @@ class SyncOrchestratorTest {
             "download.txt" to entry("download.txt", 16, "downloadsha", "2026-01-02T00:00:00Z", id = "id-download", rev = "id-download:1"),
             "remote-new.txt" to entry("remote-new.txt", 8, "movelocalsha", "2026-01-05T00:00:00Z", id = "id-movelocal", rev = "id-movelocal:1"),
             "settle.txt" to entry("settle.txt", 9, "settlesha", "2026-01-06T00:00:00Z", id = "id-settle", rev = "id-settle:2"),
+            // The drive's own copy at `conflict.txt` — what the Conflict action downloads back
+            // under the original path once this machine's copy has stepped aside.
+            "conflict.txt" to entry("conflict.txt", 20, "conflictremotesha", "2026-01-07T00:00:00Z", id = "id-conflict-remote", rev = "id-conflict-remote:1"),
         )
 
         val actions = listOf(
@@ -189,6 +197,7 @@ class SyncOrchestratorTest {
             fileAccess = fileAccess,
             localStore = localStore,
             baseDao = baseDao,
+            remoteDao = remoteDao,
             skipped = listOf("bad/.hidden-file"),
         )
 
@@ -216,21 +225,30 @@ class SyncOrchestratorTest {
         assertNull(base["delete-local.txt"])
         assertNull(base["delete-remote.txt"])
 
-        // MoveRemote: old path's base entry gone, new path's base entry present under the same id.
+        // MoveRemote: old path's base entry gone, new path's base entry present under the same id,
+        // and sync_remote is mirrored to the new path too (not just sync_base).
         assertNull(base["old-name.txt"])
         assertEquals("id-move", base.getValue("new-name.txt").id)
+        assertEquals("id-move:1", base.getValue("new-name.txt").rev)
+        assertEquals("new-name.txt", remoteDao.findById("id-move")?.path)
 
         // MoveLocal: local file store told to move, old path's base entry gone, new one mirrors remote.
-        assertEquals(listOf("remote-old.txt" to "remote-new.txt"), localStore.moved)
+        // (Conflict, below, also calls localStore.move() — MoveLocal is ordered before it.)
+        assertEquals(listOf("remote-old.txt" to "remote-new.txt"), localStore.moved.take(1))
         assertNull(base["remote-old.txt"])
         assertEquals("id-movelocal:1", base.getValue("remote-new.txt").rev)
 
-        // Conflict: the remote's own id is untouched at `path`, but base[path] is settled against
-        // the LOCAL bytes (not remote's) so this exact conflict isn't re-flagged next pass. The
-        // uploaded copy lands at `renamed` under the NEW id the fake server returned.
+        // Conflict: BOTH copies now exist on disk. This machine's copy was moved aside to
+        // `renamed` and uploaded fresh; the drive's copy came down under the ORIGINAL `path`.
+        assertEquals(listOf("conflict.txt" to "conflict (conflicted copy, Pixel).txt"), localStore.moved.drop(1))
+        assertEquals("conflict-remote-bytes", localStore.written.getValue("conflict.txt").toString(Charsets.UTF_8))
         assertEquals("id-conflict-remote", base.getValue("conflict.txt").id)
-        assertEquals("conflictsha", base.getValue("conflict.txt").sha256)
+        assertEquals("conflictremotesha", base.getValue("conflict.txt").sha256)
+        assertEquals("id-conflict-remote:1", base.getValue("conflict.txt").rev)
         assertEquals("id-conflict-uploaded", base.getValue("conflict (conflicted copy, Pixel).txt").id)
+        assertEquals("conflictsha", base.getValue("conflict (conflicted copy, Pixel).txt").sha256)
+        assertEquals("id-conflict-uploaded:1", base.getValue("conflict (conflicted copy, Pixel).txt").rev)
+        assertEquals("conflict (conflicted copy, Pixel).txt", remoteDao.findById("id-conflict-uploaded")?.path)
 
         // Settle: no file operation, base just mirrors the remote entry (including its rev).
         assertEquals("id-settle:2", base.getValue("settle.txt").rev)
@@ -255,7 +273,7 @@ class SyncOrchestratorTest {
 
         val result = SyncOrchestrator.executePlan(
             actions = actions, local = local, remote = remote, api = api, httpClient = client,
-            fileAccess = fileAccess, localStore = localStore, baseDao = baseDao,
+            fileAccess = fileAccess, localStore = localStore, baseDao = baseDao, remoteDao = remoteDao,
         )
 
         assertEquals(1, result.failed.size)
@@ -278,12 +296,117 @@ class SyncOrchestratorTest {
 
         val result = SyncOrchestrator.executePlan(
             actions = emptyList(), local = emptyMap(), remote = emptyMap(), api = api, httpClient = client,
-            fileAccess = fileAccess, localStore = localStore, baseDao = baseDao,
+            fileAccess = fileAccess, localStore = localStore, baseDao = baseDao, remoteDao = remoteDao,
             skipped = listOf(".hidden", "a/name:with*bad?chars"),
         )
 
         assertEquals(listOf(".hidden", "a/name:with*bad?chars"), result.skipped)
         assertTrue(result.failed.isEmpty())
         assertTrue(baseDao.getAll().isEmpty())
+    }
+
+    /**
+     * The regression test for both Criticals: a full pass (an [Action.Upload] and an
+     * [Action.Conflict]), then feed [plan] the state [executePlan] actually left behind — the
+     * SAME `sync_base`/`sync_remote` rows it wrote, and an unchanged-since-the-pass `local`
+     * snapshot standing in for "nothing changed on disk between the two passes". If [executePlan]
+     * settled base/remote consistently, [plan] on that state has nothing left to do.
+     *
+     * Before the fix, this fails two different ways:
+     *  - Critical 1 (upload never recorded mtime/sha256, `base.rev` left null): the SECOND
+     *    `plan()` call sees `up.txt`'s base still carrying the pre-upload remote identity (nothing
+     *    mirrored `sync_remote`), so `remote` still looks like the OLD bytes — a spurious
+     *    `Action.Download` (or `Upload` again) comes back instead of an empty list.
+     *  - Critical 2 (conflict never actually moved the local file aside or downloaded the drive's
+     *    copy): the local disk state this test asserts against (both `conf.txt`'s drive copy AND
+     *    the aside copy present) never came to be, and `sync_base`'s two rows don't correspond to
+     *    real bytes at those two paths, so the second `plan()` again returns non-empty actions.
+     */
+    @Test
+    fun `a second plan against the state a pass left behind has nothing left to do`() = runBlocking {
+        val machine = "TestPixel"
+
+        // up.txt: changed locally only -> Action.Upload (replacing the existing remote file).
+        // conf.txt: changed on BOTH sides, differently -> Action.Conflict.
+        val base1 = mapOf(
+            "up.txt" to entry("up.txt", 5, "oldsha", "2026-01-01T00:00:00Z", id = "id-up", rev = "id-up:1"),
+            "conf.txt" to entry("conf.txt", 5, "oldsha2", "2026-01-01T00:00:00Z", id = "id-conf", rev = "id-conf:1"),
+        )
+        val local1 = mapOf(
+            "up.txt" to entry("up.txt", 9, "newlocalsha", "2026-02-01T00:00:00Z"),
+            "conf.txt" to entry("conf.txt", 7, "localeditsha", "2026-02-01T00:00:00Z"),
+        )
+        val remote1 = mapOf(
+            "up.txt" to entry("up.txt", 5, "oldsha", "2026-01-01T00:00:00Z", id = "id-up", rev = "id-up:1"),
+            "conf.txt" to entry("conf.txt", 8, "remoteeditsha", "2026-02-02T00:00:00Z", id = "id-conf-v2", rev = "id-conf-v2:2"),
+        )
+        val actions1 = plan(base1, local1, remote1, machine)
+        val conflictName = actions1.filterIsInstance<Action.Conflict>().single().renamed
+
+        // sync_remote as it would really stand before this pass: the pull that built `remote1`
+        // already wrote these rows.
+        remoteDao.upsertAll(
+            listOf(
+                RemoteEntry(id = "id-up", path = "up.txt", size = 5, sha256 = "oldsha", mtime = "2026-01-01T00:00:00Z", version = 1, changedAt = "2026-01-01T00:00:00Z", deleted = false),
+                RemoteEntry(id = "id-conf-v2", path = "conf.txt", size = 8, sha256 = "remoteeditsha", mtime = "2026-02-02T00:00:00Z", version = 2, changedAt = "2026-02-02T00:00:00Z", deleted = false),
+            ),
+        )
+
+        val localStore = FakeLocalFileStore()
+        val upUri = Uri.parse("content://fake/up.txt")
+        val confUri = Uri.parse("content://fake/conf.txt")
+        localStore.files["up.txt"] = upUri
+        localStore.files["conf.txt"] = confUri
+        val fileAccess = FakeFileAccess(
+            content = mapOf(upUri to ByteArray(9), confUri to ByteArray(7)),
+            names = mapOf(upUri to "up.txt", confUri to "conf.txt"),
+        )
+
+        val client = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val request = chain.request()
+                val body = bodyString(request)
+                val (code, respBody) = when {
+                    // A replace keeps the SAME file id server-side, unlike a brand-new upload.
+                    request.url.encodedPath == "/api/files/upload-url" && body.contains("\"name\":\"up.txt\"") ->
+                        200 to """{"id":"id-up","key":"k","url":"https://s3.example.com/put-up","headers":{},"vault":false}"""
+                    request.url.encodedPath == "/api/files/upload-url" && body.contains("\"name\":\"$conflictName\"") ->
+                        200 to """{"id":"id-conf-aside","key":"k","url":"https://s3.example.com/put-conf-aside","headers":{},"vault":false}"""
+                    request.url.toString() == "https://s3.example.com/put-up" -> 200 to "{}"
+                    request.url.toString() == "https://s3.example.com/put-conf-aside" -> 200 to "{}"
+                    request.url.encodedPath == "/api/files/id-up/confirm" -> 200 to "{}"
+                    request.url.encodedPath == "/api/files/id-conf-aside/confirm" -> 200 to "{}"
+                    request.url.encodedPath == "/api/files/id-conf-v2/download" ->
+                        200 to """{"url":"https://s3.example.com/get-conf","vault":false}"""
+                    request.url.toString() == "https://s3.example.com/get-conf" -> 200 to "remote-conf-bytes"
+                    else -> 500 to """{"error":"unexpected ${request.method} ${request.url}"}"""
+                }
+                jsonResponse(request, code, respBody)
+            }
+            .build()
+        val api = DriveApi(baseUrl = "https://example.com", client = client)
+
+        val result = SyncOrchestrator.executePlan(
+            actions = actions1, local = local1, remote = remote1, api = api, httpClient = client,
+            fileAccess = fileAccess, localStore = localStore, baseDao = baseDao, remoteDao = remoteDao,
+        )
+        assertTrue("expected no failures, got ${result.failed}", result.failed.isEmpty())
+        assertEquals(1, result.uploaded)
+        assertEquals(1, result.conflicts)
+
+        // The state a second pass would actually see: `sync_base`/`sync_remote` exactly as this
+        // pass left them, and a local snapshot standing in for "the disk hasn't changed since" —
+        // `up.txt` still holding its new bytes, `conf.txt` now holding what came down from the
+        // drive, and the aside copy holding this machine's original edit.
+        val base2 = baseDao.getAll().toBaseSnapshot()
+        val remote2 = remoteDao.getAll().toRemoteSnapshot()
+        val local2 = mapOf(
+            "up.txt" to entry("up.txt", 9, "newlocalsha", "2026-02-01T00:00:00Z"),
+            "conf.txt" to entry("conf.txt", 8, "remoteeditsha", "2026-02-02T00:00:00Z"),
+            conflictName to entry(conflictName, 7, "localeditsha", "2026-02-01T00:00:00Z"),
+        )
+
+        val actions2 = plan(base2, local2, remote2, machine)
+        assertTrue("expected an empty second plan, got $actions2", actions2.isEmpty())
     }
 }

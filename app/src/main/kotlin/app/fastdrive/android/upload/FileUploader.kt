@@ -48,6 +48,14 @@ object FileUploader {
      * "(conflicted copy, ...)" name, not the file's real on-disk name. Every other caller (a plain
      * `Upload`, and `UploadWorker` itself) leaves it null and gets [uri]'s own name, unchanged.
      *
+     * [mtime]/[sha256] are the LOCAL entry's own values as `SyncOrchestrator`'s scan already knows
+     * them — passed straight through to `DriveApi.uploadUrl`'s request body so the server (and,
+     * after this call, `sync_remote`/`sync_base` once the caller mirrors the result) records the
+     * same bytes-identity the local scan used to decide an upload was needed at all. Without this,
+     * the next pass's remote snapshot has no `mtime`/`sha256` for the file, `same()` can't match it
+     * against `local`, and the file re-uploads/re-downloads forever. `UploadWorker`'s plain
+     * (non-sync) uploads have no such local-scan entry to draw from and leave both null, unchanged.
+     *
      * On any failure, best-effort aborts the upload server-side (mirrors the old `UploadWorker`
      * behavior exactly) and rethrows, so callers keep their own retry/error-mapping policy.
      */
@@ -59,6 +67,8 @@ object FileUploader {
         folder: String,
         replace: String? = null,
         nameOverride: String? = null,
+        mtime: String? = null,
+        sha256: String? = null,
     ): UploadUrlResponse {
         val picked = try {
             fileAccess.stat(uri)
@@ -71,7 +81,10 @@ object FileUploader {
         }
 
         val multipart = picked.size >= UploadWorker.MULTIPART_THRESHOLD
-        val start = api.uploadUrl(nameOverride ?: picked.name, picked.contentType, picked.size, folder, multipart, replace = replace)
+        val start = api.uploadUrl(
+            nameOverride ?: picked.name, picked.contentType, picked.size, folder, multipart,
+            mtime = mtime, sha256 = sha256, replace = replace,
+        )
 
         try {
             if (!start.multipart) {

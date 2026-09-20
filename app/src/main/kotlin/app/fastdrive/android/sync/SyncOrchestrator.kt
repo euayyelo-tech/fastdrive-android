@@ -5,11 +5,14 @@ import android.os.Build
 import app.fastdrive.android.BuildConfig
 import app.fastdrive.android.api.DriveApi
 import app.fastdrive.android.auth.TokenStore
+import app.fastdrive.android.auth.handleUnauthorized
+import app.fastdrive.android.auth.isUnauthorized
 import app.fastdrive.android.data.AppDatabase
 import app.fastdrive.android.download.FileDownloader
 import app.fastdrive.android.upload.ContentResolverFileAccess
 import app.fastdrive.android.upload.FileAccess
 import app.fastdrive.android.upload.FileUploader
+import java.time.Instant
 import okhttp3.OkHttpClient
 
 /**
@@ -65,17 +68,31 @@ object SyncOrchestrator {
         // identifier, per this task's own instruction.
         val actions = plan(baseSnapshot, scan.snapshot, remoteSnapshot, machine = Build.MODEL)
 
-        return executePlan(
-            actions = actions,
-            local = scan.snapshot,
-            remote = remoteSnapshot,
-            api = api,
-            httpClient = httpClient,
-            fileAccess = fileAccess,
-            localStore = localStore,
-            baseDao = db.baseDao(),
-            skipped = scan.skipped,
-        )
+        // `.fastdrive-trash/...` paths are correctly hidden from sync by `unsyncable()`, but that's
+        // internal bookkeeping, not something the user did wrong — don't surface it as "couldn't
+        // be synced".
+        val reportableSkipped = scan.skipped.filterNot { it.startsWith("$TRASH_DIR/") }
+
+        return try {
+            executePlan(
+                actions = actions,
+                local = scan.snapshot,
+                remote = remoteSnapshot,
+                api = api,
+                httpClient = httpClient,
+                fileAccess = fileAccess,
+                localStore = localStore,
+                baseDao = db.baseDao(),
+                remoteDao = db.remoteDao(),
+                skipped = reportableSkipped,
+            )
+        } catch (e: Exception) {
+            // A 401 abandons the whole pass rather than being recorded per-action and continued
+            // past — the token is gone, so every remaining action would fail the same way. Same
+            // sign-out path `UploadWorker`/`FileListViewModel` already use for a 401 elsewhere.
+            if (isUnauthorized(e)) handleUnauthorized(tokenStore)
+            SyncResult(failed = listOf(SyncFailure(path = "", message = e.message ?: "Sync was interrupted.")))
+        }
     }
 
     /**
@@ -93,6 +110,7 @@ object SyncOrchestrator {
         fileAccess: FileAccess,
         localStore: LocalFileStore,
         baseDao: BaseDao,
+        remoteDao: RemoteDao,
         skipped: List<String> = emptyList(),
     ): SyncResult {
         var uploaded = 0
@@ -104,7 +122,13 @@ object SyncOrchestrator {
         var settled = 0
         val failed = mutableListOf<SyncFailure>()
 
-        for (action in actions) {
+        // Matches the reference engine's carryOut() ordering exactly: moves first (so a later
+        // action addressing the moved-to path sees it where it now is), then conflicts, then
+        // plain transfers/settles, deletes last (so nothing that still needs the OLD path/bytes
+        // for another action loses them to a delete run out of order).
+        val sorted = actions.sortedBy { actionOrder(it) }
+
+        for (action in sorted) {
             try {
                 when (action) {
                     is Action.Upload -> {
@@ -112,9 +136,21 @@ object SyncOrchestrator {
                         val uri = localStore.uriFor(action.path)
                             ?: error("local file for ${action.path} is missing")
                         val (folder, _) = splitPath(action.path)
-                        val result = FileUploader.upload(fileAccess, httpClient, api, uri, folder, replace = action.replaceId)
+                        val result = FileUploader.upload(
+                            fileAccess, httpClient, api, uri, folder,
+                            replace = action.replaceId, mtime = entry.mtime, sha256 = entry.sha256,
+                        )
+                        // Mirror what just went up into sync_remote directly (rather than waiting
+                        // for the next pull) and derive base's rev from that SAME mirrored row, so
+                        // base and remote agree on this file's identity right now — `same()` will
+                        // see them match on the very next pass instead of re-uploading/downloading
+                        // forever (the bug this fixes).
+                        val row = mirror(
+                            remoteDao, result.id, path = action.path, size = entry.size,
+                            sha256 = entry.sha256, mtime = entry.mtime, deleted = false, bumpVersion = true,
+                        )
                         baseDao.upsert(
-                            BaseEntry(path = action.path, id = result.id, size = entry.size, sha256 = entry.sha256, mtime = entry.mtime, rev = null),
+                            BaseEntry(path = action.path, id = result.id, size = entry.size, sha256 = entry.sha256, mtime = entry.mtime, rev = revOf(result.id, row.version)),
                         )
                         uploaded++
                     }
@@ -129,6 +165,9 @@ object SyncOrchestrator {
                     }
 
                     is Action.DeleteLocal -> {
+                        // localStore.trash() itself now tolerates the file already being gone
+                        // (returns true rather than failing), so this never retries forever over a
+                        // file that isn't there to delete in the first place.
                         if (!localStore.trash(action.path)) error("couldn't move ${action.path} to trash")
                         baseDao.deleteByPath(action.path)
                         deletedLocal++
@@ -147,9 +186,12 @@ object SyncOrchestrator {
                         val entry = local.getValue(action.to)
                         val (folder, name) = splitPath(action.to)
                         api.updateFile(action.id, folder = folder, name = name)
+                        // Mirror the new path into sync_remote so the next plan sees this id living
+                        // at `to`, even if the next pull is delayed or fails.
+                        val row = mirror(remoteDao, action.id, path = action.to)
                         baseDao.deleteByPath(action.from)
                         baseDao.upsert(
-                            BaseEntry(path = action.to, id = action.id, size = entry.size, sha256 = entry.sha256, mtime = entry.mtime, rev = null),
+                            BaseEntry(path = action.to, id = action.id, size = entry.size, sha256 = entry.sha256, mtime = entry.mtime, rev = revOf(action.id, row.version)),
                         )
                         moved++
                     }
@@ -166,27 +208,41 @@ object SyncOrchestrator {
                     }
 
                     is Action.Conflict -> {
-                        // Both sides changed differently: nothing is dropped. The remote copy at
-                        // `action.path` (`action.id`) is left exactly as it is — this action never
-                        // touches it. The LOCAL copy is uploaded fresh, under `action.renamed`, as
-                        // a brand-new remote file (never a replace).
+                        // Keep both, for real: this machine's copy steps aside on disk under
+                        // `renamed` and goes up too; the drive's copy comes down under the
+                        // ORIGINAL `path`. The local disk ends up holding BOTH files — that is what
+                        // "keep both" means. (The previous version of this code never moved the
+                        // local file and never downloaded the remote copy, so the aside copy could
+                        // be uploaded and then the ONLY on-disk copy immediately overwritten by
+                        // nothing — a straight-up data loss bug.)
                         val entry = local.getValue(action.path)
-                        val uri = localStore.uriFor(action.path)
-                            ?: error("local file for ${action.path} is missing")
+                        if (!localStore.move(action.path, action.renamed)) {
+                            error("couldn't move ${action.path} aside to ${action.renamed}")
+                        }
+                        // The aside copy isn't safely synced until ITS upload (below) succeeds —
+                        // don't claim base-settled state for it before that's true. If a base row
+                        // already existed at `renamed` from something unrelated, drop it too.
+                        baseDao.deleteByPath(action.renamed)
+
+                        val remoteEntry = remote.getValue(action.path)
+                        FileDownloader.download(api, httpClient, action.id) { localStore.openForWrite(action.path) }
+                        baseDao.upsert(
+                            BaseEntry(path = action.path, id = remoteEntry.id, size = remoteEntry.size, sha256 = remoteEntry.sha256, mtime = remoteEntry.mtime, rev = remoteEntry.rev),
+                        )
+
+                        val asideUri = localStore.uriFor(action.renamed)
+                            ?: error("aside copy for ${action.path} is missing after moving it to ${action.renamed}")
                         val (renamedFolder, renamedName) = splitPath(action.renamed)
                         val result = FileUploader.upload(
-                            fileAccess, httpClient, api, uri, renamedFolder, replace = null, nameOverride = renamedName,
+                            fileAccess, httpClient, api, asideUri, renamedFolder, replace = null, nameOverride = renamedName,
+                            mtime = entry.mtime, sha256 = entry.sha256,
                         )
-                        // `base[path]` is settled against the LOCAL bytes (not the remote's) so this
-                        // pass doesn't re-flag the exact same conflict forever. A later, ordinary
-                        // pass will then see local==base but remote (still `action.id`'s untouched
-                        // entry) differ, and issue a plain Download to reconcile `path` with
-                        // whichever copy the drive considers the original.
-                        baseDao.upsert(
-                            BaseEntry(path = action.path, id = action.id, size = entry.size, sha256 = entry.sha256, mtime = entry.mtime, rev = null),
+                        val row = mirror(
+                            remoteDao, result.id, path = action.renamed, size = entry.size,
+                            sha256 = entry.sha256, mtime = entry.mtime, deleted = false, bumpVersion = true,
                         )
                         baseDao.upsert(
-                            BaseEntry(path = action.renamed, id = result.id, size = entry.size, sha256 = entry.sha256, mtime = entry.mtime, rev = null),
+                            BaseEntry(path = action.renamed, id = result.id, size = entry.size, sha256 = entry.sha256, mtime = entry.mtime, rev = revOf(result.id, row.version)),
                         )
                         conflicts++
                     }
@@ -201,6 +257,11 @@ object SyncOrchestrator {
                     }
                 }
             } catch (e: Exception) {
+                // A 401 means the token is gone: abort the WHOLE pass immediately rather than
+                // recording it as one failed action and carrying on to the next (every remaining
+                // action would fail the exact same way). The caller (runOnePass) catches this to
+                // drive the actual sign-out.
+                if (isUnauthorized(e)) throw e
                 failed.add(SyncFailure(path = pathOf(action), message = e.message ?: "Sync action failed."))
             }
         }
@@ -216,6 +277,53 @@ object SyncOrchestrator {
             skipped = skipped,
             failed = failed,
         )
+    }
+
+    /** Matches the reference engine's `order()` exactly: moves first, then conflicts, then plain
+     *  transfers/settles, deletes last. */
+    private fun actionOrder(action: Action): Int = when (action) {
+        is Action.MoveLocal, is Action.MoveRemote -> 0
+        is Action.Conflict -> 1
+        is Action.Download, is Action.Upload, is Action.Settle -> 2
+        is Action.DeleteLocal, is Action.DeleteRemote -> 3
+    }
+
+    /**
+     * Records what this pass just did to the drive directly into `sync_remote`, the same role
+     * desktop's `mirror()` plays — so the very next plan (even before a fresh pull) sees a
+     * `sync_remote` row consistent with the `sync_base` row [executePlan] is about to write next to
+     * it, instead of `sync_base` racing ahead of a `sync_remote` that still holds stale
+     * (pre-upload) data.
+     *
+     * Fields left null default to whatever [remoteDao] already has for [id] (a full replace, same
+     * as desktop's `cur?.field` fallbacks), except [version]: [bumpVersion] increments whatever
+     * version this id already had (or starts at 1 for a brand-new id) — used for an actual content
+     * change (upload); a metadata-only change (a move) leaves the existing version untouched.
+     */
+    private suspend fun mirror(
+        remoteDao: RemoteDao,
+        id: String,
+        path: String? = null,
+        size: Long? = null,
+        sha256: String? = null,
+        mtime: String? = null,
+        deleted: Boolean? = null,
+        bumpVersion: Boolean = false,
+    ): RemoteEntry {
+        val cur = remoteDao.findById(id)
+        val version = if (bumpVersion) (cur?.version ?: 0) + 1 else cur?.version ?: 1
+        val row = RemoteEntry(
+            id = id,
+            path = path ?: cur?.path ?: "",
+            size = size ?: cur?.size ?: 0,
+            sha256 = sha256 ?: cur?.sha256,
+            mtime = mtime ?: cur?.mtime,
+            version = version,
+            changedAt = Instant.now().toString(),
+            deleted = deleted ?: cur?.deleted ?: false,
+        )
+        remoteDao.upsert(row)
+        return row
     }
 
     private fun pathOf(action: Action): String = when (action) {
