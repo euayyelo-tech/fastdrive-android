@@ -8,7 +8,9 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiInfo
+import android.os.SystemClock
 import androidx.core.content.ContextCompat
+import java.util.concurrent.ConcurrentHashMap
 
 /** What `WifiInfo.getSSID()` returns when it can't/won't report a real SSID (no permission, no
  *  active Wi-Fi connection, etc.) — never treated as a real network name. */
@@ -37,22 +39,108 @@ fun matchesTargetNetwork(condition: PauseCondition, connectedSsid: String?): Boo
 }
 
 /**
- * True when [network] is exactly [alreadyConnectedNetwork] — the network [WifiResumeWatcher.start]
- * captured as already active right before registering its callback. `Network.equals()` compares by
- * the platform's own `netId`, which is assigned fresh on every new connection event, so this is
- * `false` for a genuine reconnection even to the same SSID.
+ * Process-wide record of when this process FIRST observed each [Network].
  *
- * A `null` [alreadyConnectedNetwork] means "there is no baseline to ignore" — nothing is
- * pre-existing, so even the callback registration delivers synchronously for the currently-active
- * network counts as a real match. [WifiResumeWatcher.start] passes `null` deliberately when
- * re-arming an already-persisted pause (see its `evaluateExistingConnection` parameter).
+ * Deliberately process-scoped (a top-level `object`), NOT per-[WifiResumeWatcher] and NOT
+ * per-Activity: `MainActivity` builds a fresh watcher on every Activity creation, so anything
+ * stored on the watcher instance is wiped by a mere screen rotation. That is exactly how Round 2's
+ * fix lost the "this network was already connected when the pause was set" fact and started
+ * silently clearing freshly-set pauses after a rotation.
  *
- * Pulled out as a pure top-level function (same pattern as [matchesTargetNetwork]) so the fix for
- * Finding #1 (Phase 4 fix round) — never treating registration's own synchronous "already
- * satisfies" callback as a new connection — is directly unit-testable.
+ * For the same reason, this registry is NEVER cleared by [WifiResumeWatcher.stop] — `stop()` runs
+ * on `onDestroy()`, i.e. immediately before the recreation whose `onCreate()` must still be able to
+ * tell "same old network" from "a network that arrived after the pause".
+ *
+ * Entries are only ever added for Wi-Fi networks seen while a Wi-Fi pause is armed, so the map
+ * stays a handful of entries for the lifetime of the process; it is not worth evicting from.
  */
-fun isPreExistingConnection(network: Network, alreadyConnectedNetwork: Network?): Boolean =
-    network == alreadyConnectedNetwork
+object NetworkFirstSeen {
+    /**
+     * First-seen stamp for a network that was ALREADY connected the first time this process looked
+     * at it. We cannot know when it actually connected — only that it predates our first look — so
+     * it is recorded as "older than any pause", which is the fail-closed direction (never
+     * auto-resume a pause on a network we didn't watch arrive).
+     */
+    const val CONNECTED_BEFORE_WE_LOOKED = Long.MIN_VALUE
+
+    private val firstSeenMillis = ConcurrentHashMap<Network, Long>()
+
+    /** Records [network] as already-connected-before-we-looked, unless this process already has an
+     *  earlier (and therefore more truthful) record for it. */
+    fun recordAlreadyConnected(network: Network) {
+        firstSeenMillis.putIfAbsent(network, CONNECTED_BEFORE_WE_LOOKED)
+    }
+
+    /**
+     * Records [network] as first seen at [nowMillis] if this process has never seen it before, and
+     * returns the first-seen stamp that is now on record (the pre-existing one if there was one).
+     *
+     * A genuine (re)connection — including reconnecting to the same SSID — always gets a fresh
+     * `netId` from the platform and therefore a fresh entry here, so it reads as "arrived at
+     * [nowMillis]" even when the SSID is one we have seen before.
+     */
+    fun recordSeen(network: Network, nowMillis: Long = System.currentTimeMillis()): Long =
+        firstSeenMillis.putIfAbsent(network, nowMillis) ?: nowMillis
+
+    /** `null` when this process has never seen [network]. */
+    fun firstSeenMillis(network: Network): Long? = firstSeenMillis[network]
+
+    /** Test-only: the registry is process-scoped by design, so tests must be able to isolate. */
+    fun clearForTest() {
+        firstSeenMillis.clear()
+    }
+}
+
+/**
+ * THE INVARIANT this whole file exists to protect:
+ *
+ *   **A network that was already connected before the pause was set must never auto-resolve that
+ *   pause — no matter which code path armed the watcher.**
+ *
+ * This is decided purely from state that is true about the world (when the pause was set, when
+ * this process started, when this process first saw this network) and never from which function
+ * called [WifiResumeWatcher.start]. Two previous fix rounds keyed this decision on the caller —
+ * first on "was this the registration-time callback", then on an `evaluateExistingConnection`
+ * boolean each call site had to pass correctly — and both silently cleared a pause the user had
+ * just set, because a call site got it wrong (Round 3: an Activity recreation from a screen
+ * rotation re-runs `MainActivity.onCreate`, which passed the "this pause is old" value).
+ *
+ * The two ways a pause may legitimately resolve on the network we are already on:
+ *
+ * 1. [pauseSetAtMillis] < [processStartMillis] — the pause was set before this process existed
+ *    (yesterday's "pause until I'm on HomeWifi", app killed since). Everything visible to us now
+ *    is news to this process, so an already-connected matching network resolves it immediately
+ *    rather than waiting for a reconnection that may never come.
+ * 2. [networkFirstSeenMillis] > [pauseSetAtMillis] — we watched this exact [Network] arrive after
+ *    the pause was set. A reconnection to the same SSID counts, because the platform issues a
+ *    fresh `netId` for it.
+ *
+ * Everything else — including "the pause was set 5 seconds ago on the very network we are still
+ * sitting on, and the Activity has been recreated three times since" — must NOT resolve.
+ */
+fun shouldResolvePause(
+    pauseSetAtMillis: Long,
+    processStartMillis: Long,
+    networkFirstSeenMillis: Long,
+): Boolean = pauseSetAtMillis < processStartMillis || networkFirstSeenMillis > pauseSetAtMillis
+
+/**
+ * Wall-clock time this process started, derived from the platform's own process start stamp
+ * (`android.os.Process.getStartElapsedRealtime()`, API 24+, well under this app's `minSdk` of 29).
+ *
+ * Read from the platform rather than captured in an initializer on purpose: an initializer records
+ * when this class happened to be first loaded, which in the "user sets a pause" path happens
+ * *after* the pause was written — making a brand-new pause look older than the process and
+ * resolving it instantly. That is precisely the bug shape this round is removing.
+ *
+ * If the platform call is unavailable (a unit-test environment without this shadow), it falls back
+ * to [Long.MIN_VALUE] — "this process is older than any pause" — which disables clause 1 of
+ * [shouldResolvePause] entirely. That is the fail-closed direction: a pause is never silently
+ * cleared, at worst it waits for a real connection event.
+ */
+fun platformProcessStartMillis(): Long = runCatching {
+    System.currentTimeMillis() - (SystemClock.elapsedRealtime() - android.os.Process.getStartElapsedRealtime())
+}.getOrDefault(Long.MIN_VALUE)
 
 /**
  * Watches for a Wi-Fi connection that satisfies a [PauseCondition.AnyWifi] or
@@ -72,53 +160,46 @@ fun isPreExistingConnection(network: Network, alreadyConnectedNetwork: Network?)
  * permission itself first (rather than relying on the sentinel string) so a denied/revoked
  * permission degrades to "no SSID available" — [PauseCondition.SpecificWifi] simply never matches,
  * it never crashes and never silently resumes on the wrong network.
+ *
+ * [start] takes no "should an already-connected network count?" flag: see [shouldResolvePause].
  */
-class WifiResumeWatcher(private val context: Context) {
+class WifiResumeWatcher(
+    private val context: Context,
+    private val processStartMillis: Long = platformProcessStartMillis(),
+) {
+    /**
+     * Written on the main thread by [start], but read AND written by [stop], which
+     * [handleNetworkCandidate] calls from `ConnectivityManager`'s own callback thread —
+     * `@Volatile` so that cross-thread write is visible (matching this codebase's existing
+     * convention for a mutable field touched from more than one thread, `AppDatabase.instance`).
+     */
+    @Volatile
     private var callback: ConnectivityManager.NetworkCallback? = null
 
     /**
-     * The network [start] decided to ignore callbacks for, or `null` if it is evaluating every
-     * network including the already-connected one. Exposed (read-only) purely so a test can assert
-     * which of the two [start] modes was taken without reaching into the platform.
-     */
-    var ignoredBaselineNetwork: Network? = null
-        private set
-
-    /**
      * Starts watching for a network satisfying [condition]. A no-op call to [stop] first makes
-     * this safe to call repeatedly (e.g. re-arming on every app start) without leaking callbacks.
+     * this safe to call repeatedly (re-arming on every app start, on every Activity recreation,
+     * and whenever the user sets a new pause) without leaking callbacks.
      *
-     * [evaluateExistingConnection] decides what the network the device is ALREADY on at
-     * registration time means, which is genuinely different between this function's two call
-     * sites (Round 2, Bug 2):
-     *
-     * - `false` — the user is setting a NEW pause right now from the settings screen
-     *   (`SyncSettingsScreen.applyPause`). `registerNetworkCallback()` delivers an immediate
-     *   `onCapabilitiesChanged` for any already-matching network, and honouring it would clear the
-     *   pause the instant it was set, silently no-op-ing what the user just asked for (Finding #1
-     *   of the previous fix round). So the already-active network is captured and callbacks for
-     *   that exact [Network] are ignored. A genuine (re)connection, even to the same SSID, gets a
-     *   fresh `netId` from the platform and so is never mistaken for it.
-     *
-     * - `true` — an EXISTING, already-persisted pause is being re-armed on a fresh process start
-     *   (`MainActivity.onCreate`). Here the user has been waiting (possibly since yesterday) for
-     *   this network and is on it now, so the pause must resolve immediately rather than wait for
-     *   a reconnection that may never come. Ignoring the already-active network forever was this
-     *   round's Bug 2. No baseline is captured, so registration's own synchronous delivery counts
-     *   as a real match and takes the same resume path a later connection would.
+     * Every call site calls this the same way. Whether a network the device is already on may
+     * resolve the pause is decided from real state in [handleNetworkCandidate] — see
+     * [shouldResolvePause] for the invariant and why no caller gets a say in it.
      */
-    fun start(syncSettings: SyncSettings, condition: PauseCondition, evaluateExistingConnection: Boolean) {
+    fun start(syncSettings: SyncSettings, condition: PauseCondition) {
         stop()
-        ignoredBaselineNetwork = null
         if (condition !is PauseCondition.AnyWifi && condition !is PauseCondition.SpecificWifi) return
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return
-        val baseline = if (evaluateExistingConnection) null else cm.activeNetwork
-        ignoredBaselineNetwork = baseline
+        // Record everything already connected BEFORE registering, so registration's own synchronous
+        // "this already matches" delivery is recognised as a network we did not watch arrive. Only
+        // networks this process has never seen get a stamp here — one already on record (e.g. from
+        // the arming that happened when the user set the pause, before a rotation destroyed the
+        // previous watcher instance) keeps its original, truthful stamp.
+        connectedNetworks(cm).forEach { NetworkFirstSeen.recordAlreadyConnected(it) }
         val request = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build()
-        val cb = createResumeCallback(syncSettings, condition, baseline)
-        // Recorded BEFORE registering: with evaluateExistingConnection = true the very first
-        // delivery can resolve the pause and call stop(), and stop() can only unregister a
-        // callback it already knows about. Registration failure below undoes this.
+        val cb = createResumeCallback(syncSettings, condition)
+        // Recorded BEFORE registering: the very first delivery can resolve the pause and call
+        // stop(), and stop() can only unregister a callback it already knows about. Registration
+        // failure below undoes this.
         callback = cb
         // Finding #3 (Phase 4 fix round): registerNetworkCallback (like unregisterNetworkCallback
         // in stop() below) can throw if this app has already hit the platform's per-uid callback
@@ -127,13 +208,22 @@ class WifiResumeWatcher(private val context: Context) {
         if (!registered) callback = null
     }
 
+    /** Every network connected right now, as best the platform will tell us. `getAllNetworks()` is
+     *  deprecated at API 31 but is the only enumeration available at this app's `minSdk` of 29;
+     *  `activeNetwork` is folded in as a fallback for anything it doesn't report. */
+    private fun connectedNetworks(cm: ConnectivityManager): List<Network> {
+        @Suppress("DEPRECATION")
+        val all = runCatching { cm.allNetworks.toList() }.getOrDefault(emptyList())
+        val active = runCatching { cm.activeNetwork }.getOrNull()
+        return (all + listOfNotNull(active)).distinct()
+    }
+
     private fun createResumeCallback(
         syncSettings: SyncSettings,
         condition: PauseCondition,
-        baselineNetwork: Network?,
     ): ConnectivityManager.NetworkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
-            handleNetworkCandidate(syncSettings, condition, network, baselineNetwork, currentSsid(capabilities))
+            handleNetworkCandidate(syncSettings, condition, network, currentSsid(capabilities))
         }
     }
 
@@ -143,26 +233,40 @@ class WifiResumeWatcher(private val context: Context) {
      * and take the shared resume path ([PauseResumeWorker.clearPauseAndReapply], the same one
      * [PauseResumeWorker.resumeNow] uses). Returns whether the pause was resolved.
      *
-     * Public, and taking [baselineNetwork] / [connectedSsid] as plain parameters, so a test can
-     * drive the REAL decision-and-resume behavior ("did this pause actually clear?") for either
-     * [start] mode, rather than only unit-testing the pure predicates it happens to call — that
-     * narrow-test habit is exactly what let both previous rounds' regressions ship.
+     * Public, and taking [connectedSsid] as a plain parameter, so a test can drive the REAL
+     * decision-and-resume behavior ("did this pause actually clear?") rather than only unit-testing
+     * the pure predicates it happens to call — that narrow-test habit is what let both previous
+     * rounds' regressions ship. Note there is no parameter describing the CALLER's intent: the
+     * decision below reads only stored state.
      */
     fun handleNetworkCandidate(
         syncSettings: SyncSettings,
         condition: PauseCondition,
         network: Network,
-        baselineNetwork: Network?,
         connectedSsid: String?,
     ): Boolean {
-        if (isPreExistingConnection(network, baselineNetwork)) return false
         if (!matchesTargetNetwork(condition, connectedSsid)) return false
+        // INVARIANT (enforced here, for every caller, present and future): a network that was
+        // already connected before this pause was set must never auto-resolve it. The three inputs
+        // below are facts about the world — when the user set the pause, when this process began,
+        // and when this process first laid eyes on this exact Network — never a flag the caller
+        // chose. See shouldResolvePause's doc comment for why.
+        val firstSeenMillis = NetworkFirstSeen.recordSeen(network)
+        if (!shouldResolvePause(syncSettings.getPauseSetAtMillis(), processStartMillis, firstSeenMillis)) {
+            return false
+        }
         stop()
         PauseResumeWorker.clearPauseAndReapply(context, syncSettings)
         return true
     }
 
-    /** Unregisters the callback if one is active. Safe to call when already stopped. */
+    /**
+     * Unregisters the callback if one is active. Safe to call when already stopped.
+     *
+     * Deliberately does NOT touch [NetworkFirstSeen]: this runs on `MainActivity.onDestroy()`, and
+     * the very next thing that happens after a rotation is an `onCreate()` that needs those records
+     * to know the network it is looking at is the same one the user set the pause on.
+     */
     fun stop() {
         val cb = callback ?: return
         val cm = context.getSystemService(ConnectivityManager::class.java)

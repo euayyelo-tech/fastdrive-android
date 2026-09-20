@@ -25,6 +25,40 @@ class SyncSettingsTest {
     private val context = ApplicationProvider.getApplicationContext<Application>()
     private val settings = SyncSettings(context)
 
+    // Round 3: the pause timestamp WifiResumeWatcher's invariant is keyed on. It must exist for
+    // every stored pause and must vanish with the pause, so an unpaused SyncSettings can never hand
+    // the watcher a stale "set at" from a pause that is long gone.
+
+    @Test
+    fun `pause set-at defaults to unknown when nothing is paused`() {
+        assertEquals(Long.MIN_VALUE, settings.getPauseSetAtMillis())
+    }
+
+    @Test
+    fun `pause set-at is stored for every condition type and cleared on resume`() {
+        listOf(
+            PauseCondition.Timer(System.currentTimeMillis() + 60_000L),
+            PauseCondition.AnyWifi,
+            PauseCondition.SpecificWifi("HomeWifi"),
+            PauseCondition.Manual,
+        ).forEachIndexed { index, condition ->
+            val setAt = 1_700_000_000_000L + index
+            settings.setPauseCondition(condition, nowMillis = setAt)
+            assertEquals(setAt, settings.getPauseSetAtMillis())
+        }
+
+        settings.setPauseCondition(null)
+        assertEquals(Long.MIN_VALUE, settings.getPauseSetAtMillis())
+    }
+
+    @Test
+    fun `clearAccountState drops the pause set-at along with the pause`() {
+        WorkManagerTestInitHelper.initializeTestWorkManager(context)
+        settings.setPauseCondition(PauseCondition.AnyWifi, nowMillis = 1_700_000_000_000L)
+        settings.clearAccountState()
+        assertEquals(Long.MIN_VALUE, settings.getPauseSetAtMillis())
+    }
+
     @Test
     fun `folder uri defaults to null`() {
         assertNull(settings.getFolderUri())

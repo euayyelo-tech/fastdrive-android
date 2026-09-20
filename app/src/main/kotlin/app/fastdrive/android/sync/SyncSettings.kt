@@ -131,8 +131,28 @@ class SyncSettings(context: Context) {
         }
     }
 
-    fun setPauseCondition(condition: PauseCondition?) {
+    /**
+     * Wall-clock time the currently-stored pause condition was set, or [PAUSE_SET_AT_UNKNOWN] when
+     * nothing is paused (or when the pause was stored by a build predating this key).
+     *
+     * This exists so [WifiResumeWatcher] can answer "did this network arrive AFTER the user set
+     * this pause?" from real persisted state instead of from a flag each call site has to pass
+     * correctly — see [shouldResolvePause]. [PAUSE_SET_AT_UNKNOWN] is [Long.MIN_VALUE], i.e. "older
+     * than anything", so a pause left over from an older install behaves exactly like a pause that
+     * predates this process: an already-connected matching network resolves it.
+     */
+    fun getPauseSetAtMillis(): Long = prefs.getLong(KEY_PAUSE_SET_AT, PAUSE_SET_AT_UNKNOWN)
+
+    /**
+     * [nowMillis] is injectable purely so tests can place a pause definitively before or after some
+     * other event; production always uses the real clock.
+     */
+    @JvmOverloads
+    fun setPauseCondition(condition: PauseCondition?, nowMillis: Long = System.currentTimeMillis()) {
         val editor = prefs.edit()
+        // Stamped for every condition type, cleared whenever the pause is (so an unpaused
+        // SyncSettings can never hand WifiResumeWatcher a stale "set at" from a previous pause).
+        if (condition == null) editor.remove(KEY_PAUSE_SET_AT) else editor.putLong(KEY_PAUSE_SET_AT, nowMillis)
         when (condition) {
             null -> editor.remove(KEY_PAUSE_TYPE).remove(KEY_PAUSE_RESUME_AT).remove(KEY_PAUSE_SSID)
             is PauseCondition.Timer -> editor.putString(KEY_PAUSE_TYPE, PAUSE_TYPE_TIMER)
@@ -189,6 +209,7 @@ class SyncSettings(context: Context) {
             .remove(KEY_PAUSE_TYPE)
             .remove(KEY_PAUSE_RESUME_AT)
             .remove(KEY_PAUSE_SSID)
+            .remove(KEY_PAUSE_SET_AT)
             .apply()
         WorkManager.getInstance(appContext).cancelUniqueWork(PauseResumeWorker.PAUSE_RESUME_WORK_NAME)
     }
@@ -200,6 +221,12 @@ class SyncSettings(context: Context) {
         const val KEY_PAUSE_TYPE = "sync_pause_type"
         const val KEY_PAUSE_RESUME_AT = "sync_pause_resume_at"
         const val KEY_PAUSE_SSID = "sync_pause_ssid"
+
+        /** When the stored pause condition was set — see [getPauseSetAtMillis]. */
+        const val KEY_PAUSE_SET_AT = "sync_pause_set_at"
+
+        /** "Older than anything": no pause stored, or a pause written before this key existed. */
+        const val PAUSE_SET_AT_UNKNOWN = Long.MIN_VALUE
 
         const val PAUSE_TYPE_TIMER = "TIMER"
         const val PAUSE_TYPE_ANY_WIFI = "ANY_WIFI"
