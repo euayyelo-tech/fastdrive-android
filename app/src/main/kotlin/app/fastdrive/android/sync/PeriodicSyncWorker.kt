@@ -44,6 +44,7 @@ class PeriodicSyncWorker @JvmOverloads constructor(
             // Finding #4: surface what this pass actually did — counts, every skipped path, every
             // failure's own message — rather than silently discarding the SyncResult.
             logSyncResult(result)
+            postSyncNotification(applicationContext, result)
             Result.success()
         } catch (e: Exception) {
             if (retryable(statusOf(e))) Result.retry() else Result.failure()

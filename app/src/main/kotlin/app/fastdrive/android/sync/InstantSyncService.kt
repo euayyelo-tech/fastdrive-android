@@ -76,6 +76,7 @@ class InstantSyncService : Service() {
                     val result = runPass(applicationContext)
                     // Finding #4: surface what this pass actually did instead of discarding it.
                     logSyncResult(result)
+                    postSyncNotification(applicationContext, result)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
